@@ -1,22 +1,22 @@
 openapi: 3.1.0
 info:
-  # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: Video generation platform API
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: pipeline
+    description: Video generation pipeline
 paths:
   /healthz:
     get:
       operationId: healthCheck
       tags: [health]
       summary: Health check
-      description: Returns server health status
       responses:
         "200":
           description: Healthy
@@ -24,6 +24,139 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /init:
+    post:
+      operationId: initSession
+      tags: [pipeline]
+      summary: Fetch daily news and generate script + prompts
+      responses:
+        "200":
+          description: Script and session initialized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionInit"
+        "500":
+          description: Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /produce/{sessionId}:
+    post:
+      operationId: produceVideo
+      tags: [pipeline]
+      summary: Upload character image and start full video production
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/ProduceInput"
+      responses:
+        "202":
+          description: Production started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProduceStarted"
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          description: Error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /status/{sessionId}:
+    get:
+      operationId: getStatus
+      tags: [pipeline]
+      summary: Poll production status and progress
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Current status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProductionStatus"
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /result/{sessionId}:
+    get:
+      operationId: getResult
+      tags: [pipeline]
+      summary: Get final video metadata and download URL
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Final result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VideoResult"
+        "404":
+          description: Session not found or not ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /download/{sessionId}:
+    get:
+      operationId: downloadVideo
+      tags: [pipeline]
+      summary: Download the final MP4 video
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: MP4 file
+          content:
+            video/mp4:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
 components:
   schemas:
     HealthStatus:
@@ -34,3 +167,125 @@ components:
       required:
         - status
 
+    ApiError:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error
+
+    Segment:
+      type: object
+      properties:
+        index:
+          type: integer
+          description: "Segment number (0-9)"
+        text:
+          type: string
+          description: "Narrative text for this audio segment"
+        image_prompts:
+          type: array
+          items:
+            type: string
+          description: "2 image prompts for this segment"
+      required:
+        - index
+        - text
+        - image_prompts
+
+    SessionInit:
+      type: object
+      properties:
+        session_id:
+          type: string
+        topic:
+          type: string
+          description: "News topic found today"
+        title:
+          type: string
+        description:
+          type: string
+        hashtags:
+          type: array
+          items:
+            type: string
+        segments:
+          type: array
+          items:
+            $ref: "#/components/schemas/Segment"
+          description: "10 segments, each with text + 2 image prompts"
+      required:
+        - session_id
+        - topic
+        - title
+        - description
+        - hashtags
+        - segments
+
+    ProduceInput:
+      type: object
+      properties:
+        note:
+          type: string
+          description: "Optional note (actual file upload handled as multipart)"
+      required: []
+
+    ProduceStarted:
+      type: object
+      properties:
+        session_id:
+          type: string
+        status:
+          type: string
+      required:
+        - session_id
+        - status
+
+    ProductionStatus:
+      type: object
+      properties:
+        session_id:
+          type: string
+        status:
+          type: string
+          enum: [pending, generating_images, generating_audio, assembling, done, error]
+        progress:
+          type: integer
+          description: "Progress percentage 0-100"
+        current_step:
+          type: string
+          description: "Human-readable current step description"
+        error:
+          type: ["string", "null"]
+      required:
+        - session_id
+        - status
+        - progress
+        - current_step
+
+    VideoResult:
+      type: object
+      properties:
+        session_id:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+        hashtags:
+          type: array
+          items:
+            type: string
+        video_url:
+          type: string
+          description: "URL to download the video"
+        duration_seconds:
+          type: number
+      required:
+        - session_id
+        - title
+        - description
+        - hashtags
+        - video_url
+        - duration_seconds

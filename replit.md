@@ -1,36 +1,51 @@
-# [Project name]
+# V-CTRL — Automated Video Production Platform
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+A platform that automatically generates 75-second narrative videos from today's news. It fetches a news topic, writes a 10-segment script, generates 20 AI images (chained for character consistency), synthesizes 10 audio segments via Gemini TTS, then assembles everything with MoviePy (Ken Burns effect + burned-in subtitles).
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
+- `python artifacts/api-server/app.py` — run the Flask API server (port 8080)
+- `pnpm --filter @workspace/frontend run dev` — run the React frontend
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
 
 ## Stack
 
 - pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- **Frontend:** React + Vite + Tailwind CSS (dark studio theme)
+- **Backend:** Python 3.11 + Flask (replaces Node.js api-server)
+- **Video pipeline:** MoviePy 1.0.3, Pillow, numpy
+- **AI:** Gemini 2.5 Flash TTS, external image edit API
+- **API codegen:** Orval (from OpenAPI spec)
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `lib/api-spec/openapi.yaml` — API contract (source of truth)
+- `artifacts/api-server/app.py` — Flask routes
+- `artifacts/api-server/pipeline.py` — full video generation pipeline
+- `artifacts/frontend/src/` — React frontend (dark V-CTRL UI)
+- `lib/api-client-react/src/generated/` — generated React Query hooks
+- `/tmp/temp_sessions/{session_id}/` — runtime session storage (images, audio, video)
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- Python Flask replaces the Node.js api-server entirely (MoviePy is Python-only)
+- Character consistency maintained by chaining: each image edit receives the previous image as base64 context
+- 10 audio files × 2 images each = 20 images + 10 audios = ~75s video
+- Production runs in a background thread; frontend polls `/api/status/{id}` every 2s
+- Sessions stored in `/tmp/temp_sessions/` — ephemeral, cleared on restart
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+- **Step 1:** Click "Lancer la recherche" → fetches today's news → generates 10-segment script + 20 image prompts
+- **Step 2:** Upload a character image (PNG/JPG) → triggers full production pipeline
+- **Step 3:** Watch real-time progress → download final MP4 with title, description, and hashtags
+
+## Required Environment Variables
+
+- `GEMINI_API_KEY` — Google Gemini API key (for TTS audio generation)
+- `PORT` — auto-set by Replit workflows (8080)
 
 ## User preferences
 
@@ -38,7 +53,10 @@ _Populate as you build — explicit user instructions worth remembering across s
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
+- The Flask server runs from `artifacts/api-server/` directory — paths in artifact.toml must be relative to that directory
+- MoviePy's TextClip requires ImageMagick (`convert` binary); if subtitles fail, they are silently skipped
+- Gemini TTS model: `gemini-2.5-flash-preview-tts` — check for model name updates
+- The text API (`delfaapiai.vercel.app`) may return JSON in various shapes; pipeline has fallback handling
 
 ## Pointers
 
