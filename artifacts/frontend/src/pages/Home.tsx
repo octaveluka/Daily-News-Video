@@ -3,7 +3,7 @@ import { DashboardZone } from "@/components/DashboardZone";
 import { UploadZone } from "@/components/UploadZone";
 import { OutputZone } from "@/components/OutputZone";
 import { SessionHistory } from "@/components/SessionHistory";
-import { SessionInit } from "@workspace/api-client-react/src/generated/api.schemas";
+import type { SessionInit } from "@workspace/api-client-react";
 
 export default function Home() {
   const [sessionData, setSessionData] = useState<SessionInit | null>(null);

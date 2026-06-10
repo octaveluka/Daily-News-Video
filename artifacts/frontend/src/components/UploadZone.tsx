@@ -138,7 +138,7 @@ export function UploadZone({ isActive, isDisabled, characterImage, onImageChange
                 </Button>
                 <Button 
                   variant="outline" 
-                  onClick={(e) => { e.stopPropagation(); setCharacterImage(null); setPreviewUrl(null); }}
+                  onClick={(e) => { e.stopPropagation(); onImageChange(null); setPreviewUrl(null); }}
                   disabled={isStarting}
                 >
                   Reset
