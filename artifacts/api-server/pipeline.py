@@ -1,19 +1,22 @@
 """
-Video generation pipeline — V-CTRL
-  Phase 1 : fetch news  → generate 10-segment script + 20 image prompts
-  Phase 2 : images (chained, sequential) + audio (parallel) run SIMULTANEOUSLY
-  Phase 3 : MoviePy 2.x assembly with Ken Burns + PIL-baked subtitles
-Sessions stored on persistent disk at /home/runner/workspace/data/sessions/
+V-CTRL — Video generation pipeline
+  Phase 1 : fetch news → 10-segment script + 20 image prompts
+  Phase 2 : images (chained sequential) + audio (parallel) run SIMULTANEOUSLY
+  Phase 3 : pure ffmpeg assembly — Ken Burns via scale+crop, subtitles via PIL
+Audio note: Gemini TTS returns raw PCM (24 kHz, 16-bit, mono) — we wrap it in WAV.
 """
 
+import io
 import os
 import json
 import uuid
+import wave
 import base64
-import time
-import logging
-import threading
+import array
 import shutil
+import logging
+import subprocess
+import threading
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -23,7 +26,10 @@ from PIL import Image as PILImage, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
 
-# Persistent storage — survives server restarts
+# ---------------------------------------------------------------------------
+# Paths & constants
+# ---------------------------------------------------------------------------
+
 SESSIONS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "data", "sessions",
@@ -34,11 +40,34 @@ TEXT_API_URL   = "https://delfaapiai.vercel.app/ai/copilot"
 IMAGE_EDIT_URL = "https://gem-tw6a.onrender.com/edit"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-VIDEO_SIZE = (1280, 720)
-FPS        = 24
+VIDEO_W, VIDEO_H = 1280, 720
+FPS              = 24
 
-# Lock used when multiple threads write progress concurrently
 _status_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# ffmpeg helper
+# ---------------------------------------------------------------------------
+
+def _ffmpeg() -> str:
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
+
+
+def _run_ff(args: list, timeout: int = 180):
+    """Run ffmpeg/ffprobe, raise on error with stderr in message."""
+    result = subprocess.run(
+        args, capture_output=True, timeout=timeout
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg error (rc={result.returncode}):\n{result.stderr.decode(errors='replace')[-2000:]}"
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +99,6 @@ def save_session(session_id: str, data: dict):
 
 
 def list_sessions() -> list[dict]:
-    """Return all sessions sorted newest-first."""
     sessions = []
     if not os.path.isdir(SESSIONS_DIR):
         return sessions
@@ -92,7 +120,8 @@ def list_sessions() -> list[dict]:
     return sessions
 
 
-def update_status(session_id: str, status: str, progress: int, current_step: str, error: str | None = None):
+def update_status(session_id: str, status: str, progress: int,
+                  current_step: str, error: str | None = None):
     with _status_lock:
         data = load_session(session_id) or {}
         data["status"]       = status
@@ -139,7 +168,7 @@ def _extract_json(text: str) -> dict:
     m = re.search(r'\{.*\}', text, re.DOTALL)
     if m:
         return json.loads(m.group())
-    raise ValueError(f"No JSON found in: {text[:200]}")
+    raise ValueError(f"No JSON found: {text[:200]}")
 
 
 def _fallback_script(topic: str) -> dict:
@@ -152,8 +181,8 @@ def _fallback_script(topic: str) -> dict:
                 "index": i,
                 "text":  f"Segment {i+1} : {topic[:50]}",
                 "image_prompts": [
-                    f"Cinematic news reporter scene about {topic[:40]}, photorealistic, scene {i*2+1}",
-                    f"Close-up dramatic portrait related to {topic[:40]}, studio lighting, scene {i*2+2}",
+                    f"Cinematic news scene about {topic[:40]}, photorealistic, scene {i*2+1}",
+                    f"Dramatic close-up related to {topic[:40]}, studio lighting, scene {i*2+2}",
                 ],
             }
             for i in range(10)
@@ -162,10 +191,8 @@ def _fallback_script(topic: str) -> dict:
 
 
 def fetch_news_and_generate_script() -> dict:
-    """Fetch today's top news and build a 10-segment script. Returns SessionInit-shaped dict."""
     session_id = str(uuid.uuid4())
 
-    # --- Fetch news topic ---
     try:
         topic_raw = _call_text_api(
             "Donne-moi l'actualité la plus importante d'aujourd'hui en une seule phrase courte, "
@@ -177,7 +204,6 @@ def fetch_news_and_generate_script() -> dict:
         logger.warning("News API failed: %s", e)
         topic = "L'intelligence artificielle transforme le monde du travail"
 
-    # --- Generate script ---
     t30 = topic[:30]
     script_prompt = (
         f'Tu es un scénariste. Sujet: "{topic}"\n'
@@ -187,28 +213,27 @@ def fetch_news_and_generate_script() -> dict:
         '"hashtags":["#tag1","#tag2","#tag3","#tag4","#tag5"],'
         '"segments":['
         + ",".join(
-            f'{{"index":{i},"text":"Texte narratif percutant en français pour le segment {i+1} sur le sujet",'
-            f'"image_prompts":["cinematic scene {i*2+1} about {t30}, photorealistic, dramatic","cinematic scene {i*2+2} about {t30}, studio lighting"]}}'
+            f'{{"index":{i},"text":"Texte narratif percutant en français segment {i+1}",'
+            f'"image_prompts":["cinematic scene {i*2+1} about {t30}, photorealistic","cinematic scene {i*2+2} about {t30}, dramatic lighting"]}}'
             for i in range(10)
         )
         + ']}'
-        + '\nRemplace les textes génériques par du contenu réel. JSON uniquement.'
+        + '\nRemplace les textes par du contenu réel. JSON uniquement.'
     )
 
     try:
-        script_raw = _call_text_api(script_prompt, timeout=90)
+        script_raw  = _call_text_api(script_prompt, timeout=90)
         script_data = _extract_json(script_raw)
     except Exception as e:
-        logger.warning("Script generation failed (%s), using fallback", e)
+        logger.warning("Script generation failed (%s), fallback", e)
         script_data = _fallback_script(topic)
 
-    # Validate & pad segments
     segments = script_data.get("segments", [])
     while len(segments) < 10:
         i = len(segments)
         segments.append({
             "index": i,
-            "text": f"Un aspect crucial : {topic[:50]}",
+            "text":  f"Un aspect crucial : {topic[:50]}",
             "image_prompts": [
                 f"Cinematic scene about {topic[:40]}, photorealistic, scene {i*2+1}",
                 f"Dramatic close-up about {topic[:40]}, studio lighting, scene {i*2+2}",
@@ -227,9 +252,9 @@ def fetch_news_and_generate_script() -> dict:
         "session_id":   session_id,
         "created_at":   datetime.datetime.utcnow().isoformat(),
         "topic":        topic,
-        "title":        script_data.get("title", f"Actualité: {topic}")[:80],
+        "title":        script_data.get("title",       f"Actualité: {topic}")[:80],
         "description":  script_data.get("description", "Une vidéo sur l'actualité du jour.")[:200],
-        "hashtags":     script_data.get("hashtags", ["#actu", "#news", "#viral", "#info", "#tendance"])[:5],
+        "hashtags":     script_data.get("hashtags",    ["#actu", "#news", "#viral", "#info", "#tendance"])[:5],
         "segments":     segments,
         "status":       "pending",
         "progress":     0,
@@ -241,7 +266,7 @@ def fetch_news_and_generate_script() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2a — Image generation  (sequential, chained for character consistency)
+# Phase 2a — Image generation (sequential, chained)
 # ---------------------------------------------------------------------------
 
 def _encode_b64(path: str) -> str:
@@ -249,20 +274,19 @@ def _encode_b64(path: str) -> str:
         return base64.b64encode(f.read()).decode()
 
 
-def generate_images(session_id: str, character_image_path: str, session_data: dict,
-                    img_counter: list, lock: threading.Lock) -> list[str]:
-    """Generate 20 images sequentially, chaining each as context for the next."""
-    segments   = session_data["segments"]
+def generate_images(session_id: str, character_image_path: str,
+                    session_data: dict, counters: dict, lock: threading.Lock) -> list[str]:
+    segments    = session_data["segments"]
     all_prompts = [p for seg in segments for p in seg["image_prompts"]]
     image_paths = []
     prev_path   = character_image_path
 
     for i, prompt in enumerate(all_prompts):
         with lock:
-            img_counter[0] = i + 1
-        update_status(session_id, "generating",
-                      5 + int((i / 20) * 35),
-                      f"Images {i+1}/20 • Audio {img_counter[1]}/10 en cours...")
+            counters["img"] = i + 1
+        pct = 5 + int((i / 20) * 35)
+        update_status(session_id, "generating", pct,
+                      f"Images {i+1}/20 • Audio {counters['aud']}/10 en parallèle...")
 
         img_path = os.path.join(session_dir(session_id), f"image_{i:02d}.jpg")
         try:
@@ -276,7 +300,7 @@ def generate_images(session_id: str, character_image_path: str, session_data: di
             if "image" in ct:
                 raw = resp.content
             else:
-                d = resp.json()
+                d   = resp.json()
                 b64 = d.get("image") or d.get("data") or d.get("result", "")
                 if b64.startswith("data:"):
                     b64 = b64.split(",", 1)[1]
@@ -286,7 +310,7 @@ def generate_images(session_id: str, character_image_path: str, session_data: di
             prev_path = img_path
             logger.info("[%s] Image %d/20 OK", session_id, i + 1)
         except Exception as e:
-            logger.error("[%s] Image %d failed: %s — copying previous", session_id, i + 1, e)
+            logger.error("[%s] Image %d failed: %s", session_id, i + 1, e)
             shutil.copy(prev_path, img_path)
         image_paths.append(img_path)
 
@@ -294,32 +318,56 @@ def generate_images(session_id: str, character_image_path: str, session_data: di
 
 
 # ---------------------------------------------------------------------------
-# Phase 2b — Audio generation  (parallel segments)
+# Phase 2b — Audio generation (parallel segments)
 # ---------------------------------------------------------------------------
 
+def _pcm_to_wav(pcm_data: bytes, sample_rate: int = 24000,
+                channels: int = 1, sample_width: int = 2) -> bytes:
+    """Wrap raw PCM bytes in a WAV container."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(sample_width)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_data)
+    return buf.getvalue()
+
+
 def _generate_gemini_tts(text: str) -> bytes:
+    """Call Gemini TTS. Returns proper WAV bytes."""
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY not set")
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent"
+    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+           "gemini-2.5-flash-preview-tts:generateContent")
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
     payload = {
         "contents": [{"parts": [{"text": text}]}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
-            "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Kore"}}},
+            "speechConfig": {"voiceConfig": {
+                "prebuiltVoiceConfig": {"voiceName": "Kore"}
+            }},
         },
     }
     resp = requests.post(url, headers=headers, json=payload, timeout=60)
     resp.raise_for_status()
-    data = resp.json()
-    b64 = data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
-    return base64.b64decode(b64)
+    data  = resp.json()
+    part  = data["candidates"][0]["content"]["parts"][0]["inlineData"]
+    mime  = part.get("mimeType", "audio/pcm")
+    raw   = base64.b64decode(part["data"])
+
+    # Gemini TTS returns raw PCM (24 kHz, 16-bit, mono) — NOT a valid WAV file.
+    # Detect by checking RIFF magic or mime type.
+    is_wav = raw[:4] == b"RIFF"
+    if not is_wav:
+        # Assume 24 kHz, 16-bit, mono PCM
+        raw = _pcm_to_wav(raw, sample_rate=24000, channels=1, sample_width=2)
+    return raw
 
 
-def _silent_wav(path: str, duration: float = 7.5):
-    import wave, array
-    sample_rate = 22050
-    num_frames  = int(sample_rate * duration)
+def _silent_wav(path: str, duration: float = 7.5, sample_rate: int = 24000):
+    """Write a silent WAV file."""
+    num_frames = int(sample_rate * duration)
     with wave.open(path, "w") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
@@ -327,64 +375,59 @@ def _silent_wav(path: str, duration: float = 7.5):
         wf.writeframes(array.array("h", [0] * num_frames).tobytes())
 
 
-def _generate_one_audio(session_id: str, i: int, seg: dict, audio_counter: list, lock: threading.Lock) -> str:
+def _wav_duration(path: str) -> float:
+    """Read duration from WAV header."""
+    try:
+        with wave.open(path, "r") as wf:
+            return wf.getnframes() / wf.getframerate()
+    except Exception:
+        return 7.5
+
+
+def _generate_one_audio(session_id: str, i: int, seg: dict,
+                        counters: dict, lock: threading.Lock) -> str:
     audio_path = os.path.join(session_dir(session_id), f"audio_{i:02d}.wav")
     try:
-        audio_bytes = _generate_gemini_tts(seg["text"])
+        wav_bytes = _generate_gemini_tts(seg["text"])
         with open(audio_path, "wb") as f:
-            f.write(audio_bytes)
-        logger.info("[%s] Audio %d/10 OK", session_id, i + 1)
+            f.write(wav_bytes)
+        logger.info("[%s] Audio %d/10 OK (%.1fs)", session_id, i + 1,
+                    _wav_duration(audio_path))
     except Exception as e:
         logger.error("[%s] Audio %d failed: %s — silent fallback", session_id, i + 1, e)
         _silent_wav(audio_path, duration=7.5)
     with lock:
-        audio_counter[0] += 1
+        counters["aud"] += 1
     return audio_path
 
 
 def generate_audio(session_id: str, session_data: dict,
-                   audio_counter: list, lock: threading.Lock) -> list[str]:
+                   counters: dict, lock: threading.Lock) -> list[str]:
     """Generate all 10 audio files in parallel (max 3 concurrent Gemini calls)."""
     segments    = session_data["segments"]
     audio_paths = [None] * len(segments)
-
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {
-            executor.submit(_generate_one_audio, session_id, i, seg, audio_counter, lock): i
+            executor.submit(_generate_one_audio, session_id, i, seg, counters, lock): i
             for i, seg in enumerate(segments)
         }
         for future in as_completed(futures):
-            i = futures[future]
+            i              = futures[future]
             audio_paths[i] = future.result()
-            update_status(session_id, "generating",
-                          5 + int((audio_counter[0] / 10) * 35),
-                          f"Images {audio_counter[1]}/20 • Audio {audio_counter[0]}/10 en cours...")
-
     return audio_paths
 
 
 # ---------------------------------------------------------------------------
-# Phase 3 — Video assembly  (MoviePy 2.x)
+# Phase 3 — Video assembly via pure ffmpeg (no MoviePy write_videofile)
 # ---------------------------------------------------------------------------
 
-def _load_frame(img_path: str) -> np.ndarray:
-    """Load image, resize to VIDEO_SIZE, return RGB numpy array."""
-    try:
-        img = PILImage.open(img_path).convert("RGB")
-        img = img.resize(VIDEO_SIZE, PILImage.LANCZOS)
-        return np.array(img)
-    except Exception:
-        return np.zeros((VIDEO_SIZE[1], VIDEO_SIZE[0], 3), dtype=np.uint8)
-
-
 def _find_font(size: int = 34) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    candidates = [
+    for c in [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
         "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
         "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-    ]
-    for c in candidates:
+    ]:
         if os.path.exists(c):
             try:
                 return ImageFont.truetype(c, size)
@@ -393,192 +436,218 @@ def _find_font(size: int = 34) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
-def _bake_subtitle(frame_arr: np.ndarray, text: str) -> np.ndarray:
-    """Draw subtitle text with shadow directly into the frame array."""
-    img  = PILImage.fromarray(frame_arr)
+def _bake_subtitle_to_file(src_path: str, text: str, dst_path: str):
+    """Load image, resize to VIDEO dimensions, burn subtitle, save as JPEG."""
+    try:
+        img = PILImage.open(src_path).convert("RGB")
+    except Exception:
+        img = PILImage.new("RGB", (VIDEO_W, VIDEO_H), (20, 20, 20))
+
+    img  = img.resize((VIDEO_W, VIDEO_H), PILImage.LANCZOS)
     draw = ImageDraw.Draw(img)
     font = _find_font(34)
-    W, H = img.size
 
-    # Word-wrap: split into at most 2 lines
+    # Word-wrap into ≤2 lines
     words = text.split()
     mid   = max(1, len(words) // 2)
-    line1 = " ".join(words[:mid])
-    line2 = " ".join(words[mid:])
-    lines = [line1, line2] if line2 else [line1]
+    lines = [" ".join(words[:mid])]
+    if words[mid:]:
+        lines.append(" ".join(words[mid:]))
 
-    y_start = H - 110
+    y = VIDEO_H - 110
     for line in lines:
         try:
-            bbox  = draw.textbbox((0, 0), line, font=font)
-            tw    = bbox[2] - bbox[0]
+            bbox = draw.textbbox((0, 0), line, font=font)
+            tw   = bbox[2] - bbox[0]
         except AttributeError:
-            tw = font.getlength(line) if hasattr(font, "getlength") else len(line) * 18
-        x = (W - tw) // 2
-        # Semi-transparent black bar behind text
-        draw.rectangle([x - 8, y_start - 4, x + tw + 8, y_start + 40], fill=(0, 0, 0, 160))
-        # Shadow
-        draw.text((x + 2, y_start + 2), line, font=font, fill=(0, 0, 0, 255))
-        # White text
-        draw.text((x, y_start), line, font=font, fill=(255, 255, 255, 255))
-        y_start += 44
+            tw = len(line) * 18
+        x = (VIDEO_W - tw) // 2
+        # Shadow + background bar
+        draw.rectangle([x - 8, y - 4, x + tw + 8, y + 40], fill=(0, 0, 0, 140))
+        draw.text((x + 2, y + 2), line, font=font, fill=(0, 0, 0, 255))
+        draw.text((x,     y    ), line, font=font, fill=(255, 255, 255, 255))
+        y += 46
 
-    return np.array(img)
+    img.save(dst_path, "JPEG", quality=90)
 
 
-def _make_ken_burns_clip(img_path: str, subtitle_text: str, duration: float):
-    """Return a VideoClip with Ken Burns zoom + subtitle baked in."""
-    from moviepy import VideoClip
-
-    base_arr = _load_frame(img_path)
-    h, w = base_arr.shape[:2]
-
-    def make_frame(t: float) -> np.ndarray:
-        zoom    = 1.0 + 0.05 * min(t / max(duration, 0.001), 1.0)
-        new_w   = int(w / zoom)
-        new_h   = int(h / zoom)
-        x0      = (w - new_w) // 2
-        y0      = (h - new_h) // 2
-        cropped = base_arr[y0:y0 + new_h, x0:x0 + new_w]
-        frame   = np.array(PILImage.fromarray(cropped).resize((w, h), PILImage.LANCZOS))
-        return _bake_subtitle(frame, subtitle_text)
-
-    return VideoClip(make_frame, duration=duration).with_fps(FPS)
+# Ken Burns via ffmpeg: scale to 110 %, slow-crop to VIDEO_WxVIDEO_H
+# Even images pan left→right, odd images pan right→left.
+_KB_SCALE = f"{int(VIDEO_W*1.1)}:{int(VIDEO_H*1.1)}"  # 1408:792
+_KB_DX    = VIDEO_W  * 1.1 - VIDEO_W                   # 128 px available
+_KB_DY    = VIDEO_H  * 1.1 - VIDEO_H                   # 72 px available
 
 
-def assemble_video(session_id: str, image_paths: list[str], audio_paths: list[str],
-                   session_data: dict) -> str:
-    """Assemble the final MP4 using MoviePy 2.x."""
-    from moviepy import AudioFileClip, concatenate_videoclips
+def _ken_burns_vf(duration: float, direction: str = "fwd") -> str:
+    """Return ffmpeg -vf filter string for a slow Ken Burns crop."""
+    if direction == "fwd":
+        x_expr = f"'trunc({_KB_DX:.1f}*t/{duration:.4f})'"
+        y_expr = f"'trunc({_KB_DY:.1f}*t/{duration:.4f})'"
+    else:
+        x_expr = f"'trunc({_KB_DX:.1f}*(1-t/{duration:.4f}))'"
+        y_expr = f"'trunc({_KB_DY:.1f}*(1-t/{duration:.4f}))'"
+    return (
+        f"scale={_KB_SCALE}:force_original_aspect_ratio=increase,"
+        f"crop={VIDEO_W}:{VIDEO_H}:{x_expr}:{y_expr},"
+        f"setsar=1"
+    )
+
+
+def assemble_video(session_id: str, image_paths: list[str],
+                   audio_paths: list[str], session_data: dict) -> str:
+    """
+    Build final MP4 using pure ffmpeg:
+      1. Bake subtitles into image files (PIL).
+      2. For each of the 10 segments, create one MP4 clip via ffmpeg
+         (2 images concatenated via filter_complex + 1 audio track).
+      3. Concatenate all 10 clips with ffmpeg concat demuxer.
+    """
+    ff   = _ffmpeg()
+    sdir = session_dir(session_id)
 
     update_status(session_id, "assembling", 72, "Assemblage vidéo en cours...")
 
-    segments = session_data["segments"]
-    clips    = []
+    segments      = session_data["segments"]
+    segment_clips = []
 
     for seg_i, seg in enumerate(segments):
         update_status(
             session_id, "assembling",
-            72 + int((seg_i / 10) * 22),
+            72 + int((seg_i / 10) * 24),
             f"Rendu segment {seg_i+1}/10...",
         )
 
-        # Audio duration determines clip length
+        # Audio for this segment
         audio_path = audio_paths[seg_i] if seg_i < len(audio_paths) else None
+        if not audio_path or not os.path.exists(audio_path):
+            audio_path = os.path.join(sdir, f"audio_{seg_i:02d}.wav")
+            _silent_wav(audio_path)
+        audio_dur  = _wav_duration(audio_path)
+        img_dur    = max(audio_dur / 2.0, 1.0)
+
+        # Bake subtitle into both images
+        baked = []
+        for offset in range(2):
+            img_idx  = seg_i * 2 + offset
+            src      = image_paths[img_idx] if img_idx < len(image_paths) else image_paths[-1]
+            baked_p  = os.path.join(sdir, f"sub_{img_idx:02d}.jpg")
+            _bake_subtitle_to_file(src, seg["text"], baked_p)
+            baked.append(baked_p)
+
+        # Ken Burns direction alternates per segment
+        direction = "fwd" if seg_i % 2 == 0 else "rev"
+        vf0 = _ken_burns_vf(img_dur, direction)
+        vf1 = _ken_burns_vf(img_dur, "rev" if direction == "fwd" else "fwd")
+
+        seg_clip = os.path.join(sdir, f"seg_{seg_i:02d}.mp4")
+        filter_complex = (
+            f"[0:v]{vf0}[v0];"
+            f"[1:v]{vf1}[v1];"
+            f"[v0][v1]concat=n=2:v=1:a=0[vout]"
+        )
+
+        cmd = [
+            ff, "-y",
+            "-loop", "1", "-t", f"{img_dur:.4f}", "-i", baked[0],
+            "-loop", "1", "-t", f"{img_dur:.4f}", "-i", baked[1],
+            "-i", audio_path,
+            "-filter_complex", filter_complex,
+            "-map", "[vout]",
+            "-map", "2:a",
+            "-t", f"{audio_dur:.4f}",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-pix_fmt", "yuv420p", "-r", str(FPS),
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "1",
+            seg_clip,
+        ]
         try:
-            audio_clip    = AudioFileClip(audio_path) if audio_path and os.path.exists(audio_path) else None
-            audio_duration = audio_clip.duration if audio_clip else 7.5
-        except Exception:
-            audio_clip    = None
-            audio_duration = 7.5
+            _run_ff(cmd, timeout=180)
+            logger.info("[%s] Segment %d/10 assembled", session_id, seg_i + 1)
+        except Exception as e:
+            logger.error("[%s] Segment %d assembly failed: %s", session_id, seg_i + 1, e)
+            raise
 
-        img_duration = audio_duration / 2.0  # 2 images share each audio segment
+        segment_clips.append(seg_clip)
 
-        for img_offset in range(2):
-            img_idx  = seg_i * 2 + img_offset
-            img_path = image_paths[img_idx] if img_idx < len(image_paths) else None
-            if img_path is None or not os.path.exists(img_path):
-                img_path = None
+    # Write concat list
+    concat_txt = os.path.join(sdir, "concat.txt")
+    with open(concat_txt, "w") as f:
+        for clip in segment_clips:
+            f.write(f"file '{clip}'\n")
 
-            clip = _make_ken_burns_clip(
-                img_path or (image_paths[0] if image_paths else ""),
-                seg["text"],
-                img_duration,
-            )
-
-            # Audio only on first image of each segment pair
-            if audio_clip is not None and img_offset == 0:
-                clip = clip.with_audio(audio_clip)
-
-            clips.append(clip)
-
-    if not clips:
-        raise ValueError("No clips were created")
-
-    final    = concatenate_videoclips(clips, method="compose")
-    out_path = os.path.join(session_dir(session_id), "final_video.mp4")
-
-    final.write_videofile(
+    out_path = os.path.join(sdir, "final_video.mp4")
+    cmd = [
+        ff, "-y",
+        "-f", "concat", "-safe", "0", "-i", concat_txt,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
         out_path,
-        fps=FPS,
-        codec="libx264",
-        audio_codec="aac",
-        temp_audiofile=os.path.join(session_dir(session_id), "temp_audio.m4a"),
-        remove_temp=True,
-        logger=None,
-    )
-    final.close()
+    ]
+    update_status(session_id, "assembling", 97, "Finalisation de la vidéo...")
+    _run_ff(cmd, timeout=300)
+    logger.info("[%s] Final video written: %s", session_id, out_path)
     return out_path
 
 
 # ---------------------------------------------------------------------------
-# Main production runner — images + audio in PARALLEL, then assemble
+# Main production runner
 # ---------------------------------------------------------------------------
 
 def run_production(session_id: str, character_image_path: str):
-    """Full pipeline. Images and audio run simultaneously in separate threads."""
+    """Full pipeline. Images + audio run simultaneously, then assemble."""
     try:
         session_data = load_session(session_id)
         if not session_data:
             logger.error("[%s] Session not found", session_id)
             return
 
+        lock     = threading.Lock()
+        counters = {"img": 0, "aud": 0}
+
         update_status(session_id, "generating", 5,
                       "Génération images et audio en parallèle...")
 
-        # Shared counters for status display
-        lock          = threading.Lock()
-        img_counter   = [0, 0]   # [images_done, audio_done] — img thread writes [0], audio writes [1]
-        audio_counter = [0, img_counter[0]]  # audio thread references same list
-
-        # We'll collect results here
-        image_result  = {"paths": None, "error": None}
-        audio_result  = {"paths": None, "error": None}
+        img_result   = {"paths": None, "error": None}
+        audio_result = {"paths": None, "error": None}
 
         def run_images():
             try:
-                image_result["paths"] = generate_images(
-                    session_id, character_image_path, session_data, img_counter, lock
+                img_result["paths"] = generate_images(
+                    session_id, character_image_path, session_data, counters, lock
                 )
             except Exception as e:
-                image_result["error"] = e
-                logger.error("[%s] Image thread error: %s", session_id, e, exc_info=True)
+                img_result["error"] = e
+                logger.error("[%s] Image thread: %s", session_id, e, exc_info=True)
 
         def run_audio():
             try:
                 audio_result["paths"] = generate_audio(
-                    session_id, session_data, audio_counter, lock
+                    session_id, session_data, counters, lock
                 )
             except Exception as e:
                 audio_result["error"] = e
-                logger.error("[%s] Audio thread error: %s", session_id, e, exc_info=True)
+                logger.error("[%s] Audio thread: %s", session_id, e, exc_info=True)
 
-        t_img   = threading.Thread(target=run_images, daemon=True)
-        t_audio = threading.Thread(target=run_audio,  daemon=True)
-        t_img.start()
-        t_audio.start()
-        t_img.join()
-        t_audio.join()
+        t1 = threading.Thread(target=run_images, daemon=True)
+        t2 = threading.Thread(target=run_audio,  daemon=True)
+        t1.start(); t2.start()
+        t1.join();  t2.join()
 
-        # Check for failures
-        if image_result["error"] and audio_result["error"]:
-            raise RuntimeError(f"Images: {image_result['error']} | Audio: {audio_result['error']}")
-
-        image_paths = image_result["paths"] or []
+        image_paths = img_result["paths"] or []
         audio_paths = audio_result["paths"] or []
 
         if not image_paths:
-            raise RuntimeError(str(image_result["error"] or "No images generated"))
+            raise RuntimeError(str(img_result["error"] or "No images generated"))
 
-        logger.info("[%s] Parallel phase done: %d images, %d audio files",
+        logger.info("[%s] Parallel done: %d images, %d audio",
                     session_id, len(image_paths), len(audio_paths))
 
-        # Phase 3 — assembly
-        update_status(session_id, "assembling", 72, "Assemblage de la vidéo...")
-        video_path = assemble_video(session_id, image_paths, audio_paths,
-                                    load_session(session_id) or session_data)
+        # Phase 3
+        video_path = assemble_video(
+            session_id, image_paths, audio_paths,
+            load_session(session_id) or session_data,
+        )
 
-        # Final save
         with _status_lock:
             data = load_session(session_id) or session_data
             data["status"]           = "done"

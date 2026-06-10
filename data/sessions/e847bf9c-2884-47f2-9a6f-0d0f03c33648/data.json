@@ -1,0 +1,103 @@
+{
+  "session_id": "e847bf9c-2884-47f2-9a6f-0d0f03c33648",
+  "created_at": "2026-06-10T20:01:39.447743",
+  "topic": "Les États-Unis annoncent mener des frappes contre l’Iran après la destruction d’un hélicoptère américain.",
+  "title": "Frappes imminentes",
+  "description": "Washington riposte après la destruction d’un hélicoptère américain, faisant monter la tension au Moyen-Orient.",
+  "hashtags": [
+    "#ÉtatsUnis",
+    "#Iran",
+    "#CriseInternationale",
+    "#TensionsMilitaires",
+    "#BreakingNews"
+  ],
+  "segments": [
+    {
+      "index": 0,
+      "text": "La nouvelle tombe comme un coup de tonnerre : Washington confirme qu’une série de frappes ciblées contre des positions iraniennes est en préparation. Dans les couloirs feutrés du Pentagone, l’atmosphère est électrique, chacun conscient que la ligne rouge vient d’être franchie.",
+      "image_prompts": [
+        "cinematic scene 1 about Les États-Unis annoncent mener, photorealistic, dramatic",
+        "cinematic scene 2 about Les États-Unis annoncent mener, studio lighting"
+      ]
+    },
+    {
+      "index": 1,
+      "text": "Quelques heures plus tôt, un hélicoptère américain a été abattu près d’une zone sensible. Les images floues de l’épave en flammes circulent déjà, alimentant la colère et la détermination de l’administration américaine.",
+      "image_prompts": [
+        "cinematic scene 3 about Les États-Unis annoncent mener, photorealistic, dramatic",
+        "cinematic scene 4 about Les États-Unis annoncent mener, studio lighting"
+      ]
+    },
+    {
+      "index": 2,
+      "text": "Dans une allocution brève mais ferme, le président américain affirme que « la réponse sera proportionnée, précise et inévitable ». Les mots résonnent, lourds de conséquences, dans un pays encore marqué par des années de conflits au Moyen-Orient.",
+      "image_prompts": [
+        "cinematic scene 5 about Les États-Unis annoncent mener, photorealistic, dramatic",
+        "cinematic scene 6 about Les États-Unis annoncent mener, studio lighting"
+      ]
+    },
+    {
+      "index": 3,
+      "text": "À Téhéran, les autorités dénoncent une provocation et promettent de défendre leur territoire. Les rues se remplissent de manifestants, certains brandissant des drapeaux, d’autres appelant à la retenue pour éviter une escalade incontrôlable.",
+      "image_prompts": [
+        "cinematic scene 7 about Les États-Unis annoncent mener, photorealistic, dramatic",
+        "cinematic scene 8 about Les États-Unis annoncent mener, studio lighting"
+      ]
+    },
+    {
+      "index": 4,
+      "text": "Les analystes militaires s’accordent : la région est au bord d’un embrasement. Les bases américaines renforcent leurs défenses, tandis que les alliés de Washington scrutent le ciel, redoutant une riposte iranienne.",
+      "image_prompts": [
+        "cinematic scene 9 about Les États-Unis annoncent mener, photorealistic, dramatic",
+        "cinematic scene 10 about Les États-Unis annoncent mener, studio lighting"
+      ]
+    },
+    {
+      "index": 5,
+      "text": "Dans les salles de commandement, les écrans s’illuminent de cartes tactiques. Les pilotes reçoivent leurs derniers briefings, conscients que chaque seconde pourrait faire basculer l’équilibre fragile de la région.",
+      "image_prompts": [
+        "cinematic scene 11 about Les États-Unis annoncent mener, photorealistic, dramatic",
+        "cinematic scene 12 about Les États-Unis annoncent mener, studio lighting"
+      ]
+    },
+    {
+      "index": 6,
+      "text": "Les familles de militaires retiennent leur souffle. Les téléphones vibrent, les messages affluent, chacun cherchant un signe rassurant. Mais l’incertitude domine, pesante et implacable.",
+      "image_prompts": [
+        "cinematic scene 13 about Les États-Unis annoncent mener, photorealistic, dramatic",
+        "cinematic scene 14 about Les États-Unis annoncent mener, studio lighting"
+      ]
+    },
+    {
+      "index": 7,
+      "text": "Dans les chancelleries du monde entier, les diplomates s’activent. Les appels à la désescalade se multiplient, mais les lignes diplomatiques semblent saturées par la tension croissante.",
+      "image_prompts": [
+        "cinematic scene 15 about Les États-Unis annoncent mener, photorealistic, dramatic",
+        "cinematic scene 16 about Les États-Unis annoncent mener, studio lighting"
+      ]
+    },
+    {
+      "index": 8,
+      "text": "Les marchés financiers réagissent brutalement. Le prix du pétrole s’envole, les investisseurs se replient, et les analystes redoutent un choc économique mondial si la situation dégénère.",
+      "image_prompts": [
+        "cinematic scene 17 about Les États-Unis annoncent mener, photorealistic, dramatic",
+        "cinematic scene 18 about Les États-Unis annoncent mener, studio lighting"
+      ]
+    },
+    {
+      "index": 9,
+      "text": "Alors que la nuit tombe sur Washington, les avions de combat se tiennent prêts. Le monde retient son souffle, suspendu à une question silencieuse : la frappe annoncée sera-t-elle le début d’un conflit ouvert ou le dernier avertissement avant un fragile retour au dialogue ?",
+      "image_prompts": [
+        "cinematic scene 19 about Les États-Unis annoncent mener, photorealistic, dramatic",
+        "cinematic scene 20 about Les États-Unis annoncent mener, studio lighting"
+      ]
+    }
+  ],
+  "status": "done",
+  "progress": 100,
+  "current_step": "Vidéo prête !",
+  "error": null,
+  "video_path": "/home/runner/workspace/data/sessions/e847bf9c-2884-47f2-9a6f-0d0f03c33648/final_video.mp4",
+  "video_url": "/api/download/e847bf9c-2884-47f2-9a6f-0d0f03c33648",
+  "duration_seconds": 75.0
+}
