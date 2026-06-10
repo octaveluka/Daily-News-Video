@@ -16,6 +16,7 @@ from pipeline import (
     fetch_news_and_generate_script,
     load_session,
     save_session,
+    list_sessions,
     update_status,
     run_production,
     session_dir,
@@ -133,6 +134,12 @@ def get_result(session_id: str):
         "video_url": f"/api/download/{session_id}",
         "duration_seconds": data.get("duration_seconds", 75.0),
     }), 200
+
+
+@app.route("/api/sessions")
+def get_all_sessions():
+    """List all sessions (newest first) for the history panel."""
+    return jsonify(list_sessions()), 200
 
 
 @app.route("/api/download/<session_id>")

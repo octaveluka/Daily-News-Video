@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { DashboardZone } from "@/components/DashboardZone";
 import { UploadZone } from "@/components/UploadZone";
 import { OutputZone } from "@/components/OutputZone";
+import { SessionHistory } from "@/components/SessionHistory";
 import { SessionInit } from "@workspace/api-client-react/src/generated/api.schemas";
 
 export default function Home() {
@@ -29,6 +30,16 @@ export default function Home() {
     setSessionData(null);
   };
 
+  /** Resume viewing / tracking a past session from history */
+  const handleResumeSession = (sessionId: string) => {
+    setIsProducing(true);
+    setProductionSessionId(sessionId);
+    // Scroll to output section smoothly
+    setTimeout(() => {
+      document.getElementById("output-section")?.scrollIntoView({ behavior: "smooth" });
+    }, 100);
+  };
+
   return (
     <main className="min-h-[100dvh] bg-background text-foreground selection:bg-primary selection:text-primary-foreground dark">
       <div className="max-w-4xl mx-auto px-6 py-16 space-y-12">
@@ -39,13 +50,13 @@ export default function Home() {
           </p>
         </header>
 
-        <DashboardZone 
-          sessionData={sessionData} 
+        <DashboardZone
+          sessionData={sessionData}
           onSessionInit={setSessionData}
           isProducing={isProducing}
         />
 
-        <UploadZone 
+        <UploadZone
           isActive={!!sessionData && !isProducing}
           isDisabled={!sessionData || isProducing}
           characterImage={characterImage}
@@ -54,10 +65,18 @@ export default function Home() {
           sessionId={sessionData?.session_id}
         />
 
-        <OutputZone 
-          isActive={isProducing || !!productionSessionId}
-          sessionId={productionSessionId}
-          onRestart={handleRestart}
+        <div id="output-section">
+          <OutputZone
+            isActive={isProducing || !!productionSessionId}
+            sessionId={productionSessionId}
+            onRestart={handleRestart}
+          />
+        </div>
+
+        {/* Past productions — always visible, auto-refreshes every 5s */}
+        <SessionHistory
+          onResumeSession={handleResumeSession}
+          activeSessionId={productionSessionId}
         />
       </div>
     </main>
