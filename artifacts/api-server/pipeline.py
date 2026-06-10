@@ -71,10 +71,15 @@ def _call_text_api(message: str, timeout: int = 60) -> str:
     )
     resp.raise_for_status()
     data = resp.json()
-    # The API may return {"response": "..."} or just a string
+    # API returns {"answer": "...", "operator": "...", ...}
     if isinstance(data, dict):
-        return data.get("response") or data.get("text") or data.get("content") or str(data)
-    return str(data)
+        for key in ("answer", "response", "text", "content", "result"):
+            val = data.get(key)
+            if val and isinstance(val, str) and val.strip():
+                return val.strip()
+        # Last resort: concatenate all string values
+        return " ".join(v for v in data.values() if isinstance(v, str))
+    return str(data).strip()
 
 
 def fetch_news_and_generate_script() -> dict:
@@ -97,43 +102,15 @@ def fetch_news_and_generate_script() -> dict:
         topic = "L'intelligence artificielle transforme le monde du travail"
 
     # --- Generate full script + prompts + metadata ---
-    script_prompt = f"""Tu es un scénariste expert en vidéo virale. 
-Sujet: "{topic}"
-
-Génère un JSON structuré EXACTEMENT selon ce format (sans markdown, sans explication, juste le JSON brut):
-{{
-  "title": "Titre accrocheur de la vidéo (max 80 chars)",
-  "description": "Description courte de la vidéo (max 150 chars)",
-  "hashtags": ["hashtag1", "hashtag2", "hashtag3", "hashtag4", "hashtag5"],
-  "segments": [
-    {{
-      "index": 0,
-      "text": "Texte narratif du segment 1 (15-20 mots, dynamique)",
-      "image_prompts": [
-        "Prompt image 1A: description visuelle détaillée en anglais pour l'IA",
-        "Prompt image 1B: description visuelle détaillée en anglais pour l'IA"
-      ]
-    }},
-    ... (10 segments au total, index 0 à 9)
-  ]
-}}
-
-Règles:
-- 10 segments exactement, chacun avec 2 prompts image distincts
-- Textes narratifs en français, percutants
-- Prompts image en anglais, très descriptifs pour une IA de génération
-- Les prompts doivent montrer un personnage humain dans différentes scènes liées au sujet
-"""
+    script_prompt = f"""Tu es un scénariste. Sujet: "{topic}"
+Réponds UNIQUEMENT avec un JSON valide, sans markdown, sans explication.
+Format exact:
+{{"title":"Titre court","description":"Description courte","hashtags":["#tag1","#tag2","#tag3","#tag4","#tag5"],"segments":[{{"index":0,"text":"Texte narratif segment 1 en français (15 mots max)","image_prompts":["cinematic scene of person related to {topic[:30]}, photorealistic","close-up dramatic portrait related to {topic[:30]}, studio lighting"]}},{{"index":1,"text":"Texte narratif segment 2","image_prompts":["wide shot scene about {topic[:30]}, cinematic","person reacting to news, dramatic lighting"]}},{{"index":2,"text":"Texte narratif segment 3","image_prompts":["scene 5","scene 6"]}},{{"index":3,"text":"Texte narratif segment 4","image_prompts":["scene 7","scene 8"]}},{{"index":4,"text":"Texte narratif segment 5","image_prompts":["scene 9","scene 10"]}},{{"index":5,"text":"Texte narratif segment 6","image_prompts":["scene 11","scene 12"]}},{{"index":6,"text":"Texte narratif segment 7","image_prompts":["scene 13","scene 14"]}},{{"index":7,"text":"Texte narratif segment 8","image_prompts":["scene 15","scene 16"]}},{{"index":8,"text":"Texte narratif segment 9","image_prompts":["scene 17","scene 18"]}},{{"index":9,"text":"Texte narratif segment 10","image_prompts":["scene 19","scene 20"]}}]}}
+Remplace tous les champs par du contenu réel sur le sujet. JSON uniquement."""
 
     try:
         script_raw = _call_text_api(script_prompt, timeout=90)
-        # Clean up potential markdown code blocks
-        script_raw = script_raw.strip()
-        if script_raw.startswith("```"):
-            script_raw = script_raw.split("```")[1]
-            if script_raw.startswith("json"):
-                script_raw = script_raw[4:]
-        script_data = json.loads(script_raw)
+        script_data = _extract_json(script_raw)
     except Exception as e:
         logger.warning("Script generation failed, using fallback: %s", e)
         script_data = _fallback_script(topic)
@@ -167,6 +144,33 @@ Règles:
 
     save_session(session_id, result)
     return result
+
+
+def _extract_json(text: str) -> dict:
+    """Robustly extract a JSON object from a potentially messy response string."""
+    text = text.strip()
+    # Strip markdown code fences
+    if text.startswith("```"):
+        parts = text.split("```")
+        for part in parts:
+            part = part.strip()
+            if part.startswith("json"):
+                part = part[4:].strip()
+            try:
+                return json.loads(part)
+            except Exception:
+                continue
+    # Try direct parse
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # Try to find the outermost {...}
+    import re
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        return json.loads(match.group())
+    raise ValueError(f"No valid JSON found in response: {text[:200]}")
 
 
 def _fallback_script(topic: str) -> dict:
