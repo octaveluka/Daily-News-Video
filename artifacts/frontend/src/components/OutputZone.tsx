@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
-import { Download, RefreshCw, Copy, Check, Terminal } from "lucide-react";
+import { Download, RefreshCw, Copy, Check, Terminal, FolderArchive } from "lucide-react";
 import {
   useGetStatus,
   useGetResult,
@@ -66,6 +66,16 @@ export function OutputZone({ isActive, sessionId, onRestart }: OutputZoneProps) 
     const a = document.createElement("a");
     a.href     = `/api/download/${sessionId}`;
     a.download = `video-${sessionId}.mp4`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+
+  const handleDownloadBundle = () => {
+    if (!sessionId) return;
+    const a = document.createElement("a");
+    a.href     = `/api/download-bundle/${sessionId}`;
+    a.download = `bundle-${sessionId.slice(0, 8)}.zip`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -168,16 +178,27 @@ export function OutputZone({ isActive, sessionId, onRestart }: OutputZoneProps) 
                   data-testid="video-player"
                 />
               </div>
-              <div className="flex gap-3">
+              <div className="flex flex-col gap-2">
+                <div className="flex gap-3">
+                  <Button
+                    onClick={handleDownload}
+                    className="flex-1 font-mono uppercase"
+                    data-testid="button-download"
+                  >
+                    <Download className="w-4 h-4 mr-2" /> Télécharger MP4
+                  </Button>
+                  <Button variant="outline" onClick={onRestart}>
+                    <RefreshCw className="w-4 h-4 mr-2" /> Nouveau
+                  </Button>
+                </div>
                 <Button
-                  onClick={handleDownload}
-                  className="flex-1 font-mono uppercase"
-                  data-testid="button-download"
+                  variant="outline"
+                  onClick={handleDownloadBundle}
+                  className="w-full font-mono text-xs uppercase tracking-wider border-primary/40 hover:border-primary hover:bg-primary/10"
+                  data-testid="button-download-bundle"
                 >
-                  <Download className="w-4 h-4 mr-2" /> Télécharger MP4
-                </Button>
-                <Button variant="outline" onClick={onRestart}>
-                  <RefreshCw className="w-4 h-4 mr-2" /> Nouveau
+                  <FolderArchive className="w-4 h-4 mr-2" />
+                  Télécharger le bundle complet (ZIP)
                 </Button>
               </div>
             </div>

@@ -5,36 +5,35 @@ import { OutputZone } from "@/components/OutputZone";
 import { SessionHistory } from "@/components/SessionHistory";
 import type { SessionInit } from "@workspace/api-client-react";
 
+export type VideoFormat = "16:9" | "9:16";
+
 export default function Home() {
-  const [sessionData, setSessionData] = useState<SessionInit | null>(null);
-  const [characterImage, setCharacterImage] = useState<File | null>(null);
-  const [isProducing, setIsProducing] = useState(false);
+  const [sessionData, setSessionData]           = useState<SessionInit | null>(null);
+  const [characterImage, setCharacterImage]     = useState<File | null>(null);
+  const [videoFormat, setVideoFormat]           = useState<VideoFormat>("16:9");
+  const [isProducing, setIsProducing]           = useState(false);
   const [productionSessionId, setProductionSessionId] = useState<string | null>(null);
 
-  // When sessionData is cleared, reset subsequent steps
   useEffect(() => {
     if (!sessionData) {
       setCharacterImage(null);
       setIsProducing(false);
       setProductionSessionId(null);
+      setVideoFormat("16:9");
     }
   }, [sessionData]);
 
-  const handleStartProduction = async () => {
+  const handleStartProduction = () => {
     if (!sessionData || !characterImage) return;
     setIsProducing(true);
     setProductionSessionId(sessionData.session_id);
   };
 
-  const handleRestart = () => {
-    setSessionData(null);
-  };
+  const handleRestart = () => setSessionData(null);
 
-  /** Resume viewing / tracking a past session from history */
   const handleResumeSession = (sessionId: string) => {
     setIsProducing(true);
     setProductionSessionId(sessionId);
-    // Scroll to output section smoothly
     setTimeout(() => {
       document.getElementById("output-section")?.scrollIntoView({ behavior: "smooth" });
     }, 100);
@@ -63,6 +62,8 @@ export default function Home() {
           onImageChange={setCharacterImage}
           onProduce={handleStartProduction}
           sessionId={sessionData?.session_id}
+          videoFormat={videoFormat}
+          onFormatChange={setVideoFormat}
         />
 
         <div id="output-section">
@@ -73,7 +74,6 @@ export default function Home() {
           />
         </div>
 
-        {/* Past productions — always visible, auto-refreshes every 5s */}
         <SessionHistory
           onResumeSession={handleResumeSession}
           activeSessionId={productionSessionId}

@@ -1,22 +1,19 @@
 """
 V-CTRL — Video generation pipeline
   Phase 1 : fetch news / custom topic → 10-segment DOCUMENTARY script + 20 image prompts
-  Phase 2 : three parallel threads start simultaneously:
-              • Thread A (External API) : 20 images — 4 sections of 5 in parallel
-              • Thread B (Gemini TTS)  : audio 0-9, parallel
-  Phase 3 : pure ffmpeg assembly — Ken Burns + subtitle baking via PIL
+  Phase 2 : 2 parallel threads:
+              • Thread A — 20 images via external API (4 sections × 5 parallel)
+              • Thread B — 10 audio segments via Gemini TTS
+  Phase 3 : ffmpeg assembly — each audio covers EXACTLY 2 images, equal time per image
 
-Image generation rules:
-  - ALL 20 images use the ORIGINAL character image as reference (never chained)
-  - 4 parallel sections of 5 images each (max_workers=5 concurrent requests)
-  - 1 audio segment covers exactly 2 images (no overflow)
+Format:  '16:9'  →  1280×720   (paysage)
+         '9:16'  →  720×1280   (portrait / TikTok / Reels)
 
-Session persistence: PostgreSQL (Replit database)
-Auto-resume: on startup, any session with status "generating"/"assembling"/"pending"
-that has a saved character_image_path and a stale heartbeat gets restarted automatically.
+Audio validation: min 2 s, RMS silence check, up to 5 retries.
+Ken Burns: 1.03× zoom (subtle).
 """
 
-import io, os, json, uuid, wave, base64, array, shutil
+import io, os, json, uuid, wave, base64, array, shutil, zipfile
 import logging, subprocess, threading, time, re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -48,14 +45,32 @@ TEXT_API_URL   = "https://delfaapiai.vercel.app/ai/copilot"
 IMAGE_EDIT_URL = "https://gem-tw6a.onrender.com/edit"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-VIDEO_W, VIDEO_H = 1280, 720
-FPS = 24
+FPS          = 24
+TOTAL_IMGS   = 20
+SECTION_SIZE = 5    # images per section
+N_SECTIONS   = 4    # sections run in parallel
 
-TOTAL_IMGS  = 20   # all via external API
-SECTION_SIZE = 5   # images per parallel section  (20 / 4 sections)
-N_SECTIONS   = 4   # sections running in parallel
+# Ken Burns zoom factor — keep subtle
+_KB_FACTOR = 1.03
 
 _status_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Format helpers
+# ---------------------------------------------------------------------------
+
+def _dims(video_format: str) -> tuple[int, int]:
+    """Return (width, height) for the given format string."""
+    if video_format == "9:16":
+        return 720, 1280
+    return 1280, 720   # default 16:9
+
+
+def _format_hint(video_format: str) -> str:
+    if video_format == "9:16":
+        return "vertical portrait format 9:16 for TikTok/Reels/Shorts"
+    return "horizontal landscape format 16:9 for YouTube"
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +78,6 @@ _status_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 
 def _get_db_conn():
-    """Return a new psycopg2 connection using DATABASE_URL."""
     db_url = os.environ.get("DATABASE_URL")
     if not db_url:
         raise RuntimeError("DATABASE_URL environment variable not set")
@@ -164,8 +178,7 @@ def list_sessions() -> list[dict]:
                 cur.execute("""
                     SELECT session_id, topic, title, status, progress,
                            current_step, error, video_path, created_at
-                    FROM sessions
-                    ORDER BY created_at DESC
+                    FROM sessions ORDER BY created_at DESC
                 """)
                 rows = cur.fetchall()
                 return [{
@@ -204,11 +217,6 @@ def update_status(session_id: str, status: str, progress: int,
 # ---------------------------------------------------------------------------
 
 def auto_resume_stalled_sessions():
-    """
-    Called once on Flask startup.
-    Any session left in 'generating'/'assembling'/'pending' state with a saved
-    character image and a heartbeat older than 5 minutes is restarted.
-    """
     try:
         conn = _get_db_conn()
         try:
@@ -251,7 +259,7 @@ def find_character_image(session_id: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 1 — Script generation (documentary / journalistic style)
+# Phase 1 — Script generation
 # ---------------------------------------------------------------------------
 
 def _call_text_api(message: str, timeout: int = 90) -> str:
@@ -298,17 +306,16 @@ Tu écris en français un récit en 10 segments pour une vidéo virale sur : "{t
 
 ═══ EXEMPLE PARFAIT ═══
 "Depuis quelque temps, un mouvement inédit prend de l'ampleur. À la suite du vote d'une loi historique accordant la nationalité béninoise aux afro-descendants, des milliers de personnes venues d'Haïti et des Caraïbes font le voyage pour renouer avec leurs racines."
-"L'un des témoignages les plus poignants : 'Aujourd'hui, je franchis la porte, mais de mon plein gré. Volontairement. Je ne suis pas enchaînée, je n'ai pas été séparée de ma famille.'"
 
 ═══ RÈGLE PROMPTS IMAGE ═══
 Chaque prompt DOIT :
-1. Mentionner "the person from the reference photo" pour que le personnage apparaisse
+1. Mentionner "the person from the reference photo"
 2. Décrire exactement le LIEU et le DÉCOR correspondant aux paroles du segment
 3. Être très différent des autres (type de plan, lumière, décor différents)
 Types : WIDE SHOT | CLOSE-UP | EXTREME CLOSE-UP | AERIAL VIEW | LOW ANGLE | SILHOUETTE | DUTCH ANGLE | OVER-THE-SHOULDER | MEDIUM SHOT | TWO-SHOT
 
 FORMAT JSON STRICT (sans markdown, sans commentaires) :
-{{"title":"...","description":"...","hashtags":["#...","#...","#...","#...","#..."],"segments":[{{"index":0,"text":"...30-45 mots...","image_prompts":["TYPE - the person from the reference photo [action liée au texte] in [décor précis du texte], [lumière], photorealistic, 8k, cinematic","TYPE - the person from the reference photo [autre action] in [autre décor lié au texte], [autre lumière], photorealistic, 8k, cinematic"]}},{{"index":1,...}},{{"index":2,...}},{{"index":3,...}},{{"index":4,...}},{{"index":5,...}},{{"index":6,...}},{{"index":7,...}},{{"index":8,...}},{{"index":9,"text":"...chute émotionnelle ou espoir...","image_prompts":["...","..."]}}]}}"""
+{{"title":"...","description":"...","hashtags":["#...","#...","#...","#...","#..."],"segments":[{{"index":0,"text":"...30-45 mots...","image_prompts":["TYPE - the person from the reference photo [action] in [décor précis], [lumière], photorealistic, 8k, cinematic","TYPE - the person from the reference photo [autre action] in [autre décor], [lumière], photorealistic, 8k, cinematic"]}},{{"index":1,...}},{{"index":2,...}},{{"index":3,...}},{{"index":4,...}},{{"index":5,...}},{{"index":6,...}},{{"index":7,...}},{{"index":8,...}},{{"index":9,"text":"...chute émotionnelle ou espoir...","image_prompts":["...","..."]}}]}}"""
 
 def _fallback_script(topic: str) -> dict:
     t = topic[:60]
@@ -368,20 +375,21 @@ def fetch_news_and_generate_script(custom_topic: str | None = None) -> dict:
 
     import datetime
     result = {
-        "session_id":   session_id,
-        "created_at":   datetime.datetime.utcnow().isoformat(),
-        "topic":        topic,
-        "title":        data.get("title", f"Reportage : {topic}")[:80],
-        "description":  data.get("description", "Un documentaire sur l'actualité du monde.")[:200],
-        "hashtags":     data.get("hashtags", ["#reportage","#documentaire","#info","#actualité","#viral"])[:5],
-        "segments":     segments,
-        "status":       "pending",
-        "progress":     0,
-        "current_step": "Script généré — en attente de l'image du personnage.",
-        "images_done":  [],
-        "audio_done":   [],
+        "session_id":    session_id,
+        "created_at":    datetime.datetime.utcnow().isoformat(),
+        "topic":         topic,
+        "title":         data.get("title", f"Reportage : {topic}")[:80],
+        "description":   data.get("description", "Un documentaire sur l'actualité du monde.")[:200],
+        "hashtags":      data.get("hashtags", ["#reportage","#documentaire","#info","#actualité","#viral"])[:5],
+        "segments":      segments,
+        "status":        "pending",
+        "progress":      0,
+        "current_step":  "Script généré — en attente de l'image du personnage.",
+        "images_done":   [],
+        "audio_done":    [],
         "last_heartbeat": 0,
-        "error":        None,
+        "error":         None,
+        "video_format":  "16:9",   # default, overwritten by produce endpoint
     }
     save_session(session_id, result)
     return result
@@ -398,22 +406,22 @@ def _encode_b64(path: str) -> str:
 
 # ---------------------------------------------------------------------------
 # Phase 2a — External API: ALL 20 images
-# 4 parallel sections of 5 images each.
-# IMPORTANT: each image uses the ORIGINAL character image as reference (no chaining).
+# 4 parallel sections of 5 — original character image as reference always
 # ---------------------------------------------------------------------------
 
 def _generate_one_image(session_id: str, i: int, prompt: str,
-                         character_image_path: str,
+                         character_image_path: str, video_format: str,
                          counters: dict, lock: threading.Lock,
                          image_paths: list) -> None:
-    """Generate a single image via the external edit API using the original character image."""
     img_path = os.path.join(session_dir(session_id), f"image_{i:02d}.jpg")
-    success  = False
+    fmt_hint = _format_hint(video_format)
+    full_prompt = f"{prompt}, {fmt_hint}"
+    success = False
 
     for attempt in range(3):
         try:
             resp = requests.post(IMAGE_EDIT_URL,
-                json={"prompt": prompt, "image": _encode_b64(character_image_path)},
+                json={"prompt": full_prompt, "image": _encode_b64(character_image_path)},
                 timeout=120)
             resp.raise_for_status()
             ct = resp.headers.get("content-type", "")
@@ -455,36 +463,25 @@ def _generate_one_image(session_id: str, i: int, prompt: str,
         data["last_heartbeat"] = time.time()
         data["status"]         = "generating"
         data["progress"]       = 5 + int((total_done / TOTAL_IMGS) * 35)
-        data["current_step"]   = (
-            f"Images {total_done}/{TOTAL_IMGS} • "
-            f"Audio {counters.get('aud', 0)}/10"
-        )
+        data["current_step"]   = f"Images {total_done}/{TOTAL_IMGS} • Audio {counters.get('aud', 0)}/10"
         save_session(session_id, data)
 
 
 def generate_all_images(session_id: str, character_image_path: str,
-                         all_prompts: list[str], counters: dict,
-                         lock: threading.Lock, image_paths: list) -> None:
-    """
-    Generate all 20 images using the external edit API.
-    4 sections of 5 images run in parallel (max_workers=5 concurrent requests).
-    Every image uses the ORIGINAL character_image_path as reference — no chaining.
-    """
-    # Build sections: [[0,1,2,3,4], [5,6,7,8,9], [10,11,12,13,14], [15,16,17,18,19]]
+                         all_prompts: list[str], video_format: str,
+                         counters: dict, lock: threading.Lock,
+                         image_paths: list) -> None:
+    """4 sections of 5 images each, all running simultaneously."""
     sections = [
         list(range(s * SECTION_SIZE, s * SECTION_SIZE + SECTION_SIZE))
         for s in range(N_SECTIONS)
     ]
 
     def run_section(indices: list[int]) -> None:
-        """Run one section: submit all 5 images to a thread pool simultaneously."""
         with ThreadPoolExecutor(max_workers=SECTION_SIZE) as pool:
             futures = [
-                pool.submit(
-                    _generate_one_image,
-                    session_id, idx, all_prompts[idx],
-                    character_image_path, counters, lock, image_paths
-                )
+                pool.submit(_generate_one_image, session_id, idx, all_prompts[idx],
+                            character_image_path, video_format, counters, lock, image_paths)
                 for idx in indices
             ]
             for f in as_completed(futures):
@@ -493,19 +490,13 @@ def generate_all_images(session_id: str, character_image_path: str,
                 except Exception as e:
                     logger.error("[%s] Section image error: %s", session_id, e)
 
-    # Launch all 4 sections simultaneously
-    section_threads = [
-        threading.Thread(target=run_section, args=(sec,), daemon=True)
-        for sec in sections
-    ]
-    for t in section_threads:
-        t.start()
-    for t in section_threads:
-        t.join()
+    threads = [threading.Thread(target=run_section, args=(sec,), daemon=True) for sec in sections]
+    for t in threads: t.start()
+    for t in threads: t.join()
 
 
 # ---------------------------------------------------------------------------
-# Phase 2b — Audio: Gemini TTS (parallel, validated, with retry)
+# Phase 2b — Audio: Gemini TTS — strict validation, min 2 s, RMS check
 # ---------------------------------------------------------------------------
 
 def _pcm_to_wav(pcm: bytes, rate: int = 24000, ch: int = 1, sw: int = 2) -> bytes:
@@ -515,26 +506,32 @@ def _pcm_to_wav(pcm: bytes, rate: int = 24000, ch: int = 1, sw: int = 2) -> byte
         wf.writeframes(pcm)
     return buf.getvalue()
 
-def _wav_duration(path: str) -> float:
+def _wav_duration(wav_bytes_or_path) -> float:
     try:
-        with wave.open(path, "r") as wf:
-            return wf.getnframes() / (wf.getframerate() or 1)
+        if isinstance(wav_bytes_or_path, (str, bytes)):
+            if isinstance(wav_bytes_or_path, str):
+                with wave.open(wav_bytes_or_path, "r") as wf:
+                    return wf.getnframes() / (wf.getframerate() or 1)
+            else:
+                with wave.open(io.BytesIO(wav_bytes_or_path), "r") as wf:
+                    return wf.getnframes() / (wf.getframerate() or 1)
     except Exception:
         return 0.0
 
-def _wav_is_silent(path: str, threshold: float = 50.0) -> bool:
+def _wav_rms(wav_bytes: bytes) -> float:
+    """Return RMS amplitude of WAV audio."""
     try:
-        with wave.open(path, "r") as wf:
-            frames = wf.readframes(wf.getnframes())
+        with wave.open(io.BytesIO(wav_bytes), "r") as wf:
             sw = wf.getsampwidth()
+            frames = wf.readframes(wf.getnframes())
         if sw != 2:
-            return False
+            return 999.0   # assume non-silent for non-16-bit
         samples = array.array("h", frames)
         if not samples:
-            return True
-        return (sum(s*s for s in samples) / len(samples)) ** 0.5 < threshold
+            return 0.0
+        return (sum(s * s for s in samples) / len(samples)) ** 0.5
     except Exception:
-        return True
+        return 0.0
 
 def _write_silent_wav(path: str, duration: float = 7.5, rate: int = 24000):
     n = int(rate * duration)
@@ -542,7 +539,11 @@ def _write_silent_wav(path: str, duration: float = 7.5, rate: int = 24000):
         wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(rate)
         wf.writeframes(array.array("h", [0] * n).tobytes())
 
+MIN_AUDIO_DURATION = 2.0    # seconds — below this we retry
+MIN_AUDIO_RMS      = 50.0   # RMS threshold for silence detection
+
 def _generate_gemini_tts(text: str, max_retries: int = 5) -> bytes:
+    """Generate audio via Gemini TTS. Validates duration ≥ 2 s and non-silence."""
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY not set")
     clean = text.strip()
@@ -559,6 +560,7 @@ def _generate_gemini_tts(text: str, max_retries: int = 5) -> bytes:
             "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Kore"}}},
         },
     }
+
     last_err = None
     for attempt in range(max_retries):
         try:
@@ -567,24 +569,32 @@ def _generate_gemini_tts(text: str, max_retries: int = 5) -> bytes:
             data = resp.json()
             b64  = data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
             if not b64:
-                raise ValueError("Empty audio data")
+                raise ValueError("Empty audio data from Gemini")
             raw = base64.b64decode(b64)
             if len(raw) < 1000:
-                raise ValueError(f"Audio too small ({len(raw)} bytes)")
+                raise ValueError(f"Audio payload too small ({len(raw)} B)")
             wav = raw if raw[:4] == b"RIFF" else _pcm_to_wav(raw)
-            buf = io.BytesIO(wav)
-            with wave.open(buf, "r") as wf:
-                dur = wf.getnframes() / wf.getframerate()
-            if dur < 0.5:
-                raise ValueError(f"Audio too short ({dur:.2f}s)")
-            logger.info("[TTS] OK attempt=%d dur=%.2fs text=%s...", attempt+1, dur, clean[:40])
+
+            # --- Strict validation ---
+            dur = _wav_duration(wav)
+            if dur < MIN_AUDIO_DURATION:
+                raise ValueError(f"Audio too short: {dur:.2f}s < {MIN_AUDIO_DURATION}s")
+            rms = _wav_rms(wav)
+            if rms < MIN_AUDIO_RMS:
+                raise ValueError(f"Audio is silent (RMS={rms:.1f} < {MIN_AUDIO_RMS})")
+
+            logger.info("[TTS] OK attempt=%d dur=%.2fs rms=%.0f text=%.40s",
+                        attempt + 1, dur, rms, clean)
             return wav
+
         except Exception as e:
             last_err = e
             wait = min(2 ** attempt, 30)
-            logger.warning("[TTS] attempt %d/%d failed: %s — retry in %ds", attempt+1, max_retries, e, wait)
+            logger.warning("[TTS] attempt %d/%d failed: %s — retry in %ds",
+                           attempt + 1, max_retries, e, wait)
             if attempt < max_retries - 1:
                 time.sleep(wait)
+
     raise RuntimeError(f"TTS failed after {max_retries} attempts: {last_err}")
 
 
@@ -592,21 +602,28 @@ def _generate_one_audio(session_id: str, i: int, seg: dict,
                          counters: dict, lock: threading.Lock) -> str:
     audio_path = os.path.join(session_dir(session_id), f"audio_{i:02d}.wav")
     text = seg.get("text", "").strip()
+
     if not text:
-        _write_silent_wav(audio_path)
+        logger.warning("[%s] Audio %d: empty text → silent placeholder", session_id, i)
+        _write_silent_wav(audio_path, 7.5)
     else:
-        try:
-            wav = _generate_gemini_tts(text)
-            with open(audio_path, "wb") as f:
-                f.write(wav)
-            if _wav_is_silent(audio_path):
-                logger.warning("[%s] Audio %d silent — retrying", session_id, i)
-                wav = _generate_gemini_tts(text, max_retries=3)
+        success = False
+        for outer in range(2):          # two outer rounds before giving up
+            try:
+                wav = _generate_gemini_tts(text, max_retries=5)
                 with open(audio_path, "wb") as f:
                     f.write(wav)
-        except Exception as e:
-            logger.error("[%s] Audio %d all retries failed: %s", session_id, i, e)
-            _write_silent_wav(audio_path)
+                success = True
+                break
+            except Exception as e:
+                logger.error("[%s] Audio %d outer-attempt %d failed: %s",
+                             session_id, i, outer + 1, e)
+                if outer == 0:
+                    time.sleep(3)
+
+        if not success:
+            logger.error("[%s] Audio %d: all attempts exhausted → silent placeholder", session_id, i)
+            _write_silent_wav(audio_path, 7.5)
 
     with lock:
         counters["aud"] = counters.get("aud", 0) + 1
@@ -635,8 +652,9 @@ def generate_audio(session_id: str, session_data: dict,
 
 
 # ---------------------------------------------------------------------------
-# Phase 3 — Video assembly via pure ffmpeg
-# 1 audio segment covers EXACTLY 2 images — no overflow
+# Phase 3 — Video assembly
+# Each audio covers EXACTLY 2 images; each image gets dur/2 time.
+# Ken Burns zoom: 1.03× (subtle).
 # ---------------------------------------------------------------------------
 
 def _find_font(size: int = 34):
@@ -651,32 +669,45 @@ def _find_font(size: int = 34):
             except Exception: pass
     return ImageFont.load_default()
 
-def _prepare_image(src: str, dst: str):
-    """Resize image to video dimensions — no subtitle overlay."""
+
+def _prepare_image(src: str, dst: str, w: int, h: int):
+    """Resize image to (w×h) — no subtitle overlay."""
     try:
         img = PILImage.open(src).convert("RGB")
     except Exception:
-        img = PILImage.new("RGB", (VIDEO_W, VIDEO_H), (20, 20, 20))
-    img = img.resize((VIDEO_W, VIDEO_H), PILImage.LANCZOS)
+        img = PILImage.new("RGB", (w, h), (20, 20, 20))
+    img = img.resize((w, h), PILImage.LANCZOS)
     img.save(dst, "JPEG", quality=90)
 
-_KB_SCALE = f"{int(VIDEO_W*1.1)}:{int(VIDEO_H*1.1)}"
-_KB_DX    = VIDEO_W * 1.1 - VIDEO_W
-_KB_DY    = VIDEO_H * 1.1 - VIDEO_H
 
-def _kb_vf(dur: float, direction: str = "fwd") -> str:
+def _kb_vf(w: int, h: int, dur: float, direction: str = "fwd") -> str:
+    """Ken Burns ffmpeg filter string. Zoom = KB_FACTOR (1.03)."""
+    sw = int(w * _KB_FACTOR)
+    sh = int(h * _KB_FACTOR)
+    dx = sw - w
+    dy = sh - h
     if direction == "fwd":
-        xe = f"'trunc({_KB_DX:.1f}*t/{dur:.4f})'"; ye = f"'trunc({_KB_DY:.1f}*t/{dur:.4f})'"
+        xe = f"'trunc({dx:.1f}*t/{dur:.4f})'"
+        ye = f"'trunc({dy:.1f}*t/{dur:.4f})'"
     else:
-        xe = f"'trunc({_KB_DX:.1f}*(1-t/{dur:.4f}))'"; ye = f"'trunc({_KB_DY:.1f}*(1-t/{dur:.4f}))'"
-    return f"scale={_KB_SCALE}:force_original_aspect_ratio=increase,crop={VIDEO_W}:{VIDEO_H}:{xe}:{ye},setsar=1"
+        xe = f"'trunc({dx:.1f}*(1-t/{dur:.4f}))'"
+        ye = f"'trunc({dy:.1f}*(1-t/{dur:.4f}))'"
+    return (f"scale={sw}:{sh}:force_original_aspect_ratio=increase,"
+            f"crop={w}:{h}:{xe}:{ye},setsar=1")
+
 
 def assemble_video(session_id: str, image_paths: list[str],
                    audio_paths: list[str], session_data: dict) -> str:
     """
-    Assemble video: 10 segments, each segment uses exactly 2 images.
-    image index for segment si: si*2 and si*2+1  (no overflow — 10*2 = 20 images total)
+    Assemble 10 segments. Each segment:
+      - audio  = audio_paths[si]
+      - image0 = image_paths[si*2]     → dur/2 seconds
+      - image1 = image_paths[si*2+1]   → dur/2 seconds
+    Total: 10 × (2 images) = 20 images, exactly matching the 10 audio tracks.
     """
+    video_format = session_data.get("video_format", "16:9")
+    vw, vh = _dims(video_format)
+
     ff   = _ffmpeg()
     sdir = session_dir(session_id)
     update_status(session_id, "assembling", 72, "Assemblage de la vidéo en cours...")
@@ -687,50 +718,63 @@ def assemble_video(session_id: str, image_paths: list[str],
         update_status(session_id, "assembling", 72 + int((si / 10) * 24),
                       f"Rendu segment {si+1}/10...", last_heartbeat=time.time())
 
-        # Audio for this segment
+        # ── Audio ──
         ap = audio_paths[si] if si < len(audio_paths) else None
         if not ap or not os.path.exists(ap):
             ap = os.path.join(sdir, f"audio_{si:02d}.wav")
             _write_silent_wav(ap)
+
         dur = _wav_duration(ap)
-        if dur < 0.5:
+        if dur < MIN_AUDIO_DURATION:
+            # One last regen attempt before using silence
             try:
-                wav = _generate_gemini_tts(segments[si]["text"], max_retries=3)
+                wav = _generate_gemini_tts(segments[si]["text"], max_retries=5)
                 with open(ap, "wb") as f: f.write(wav)
                 dur = _wav_duration(ap)
-            except Exception:
-                _write_silent_wav(ap, 7.0); dur = 7.0
+            except Exception as err:
+                logger.error("[%s] Segment %d audio re-gen failed: %s", session_id, si, err)
+            if dur < 0.1:
+                _write_silent_wav(ap, 7.5)
+                dur = 7.5
 
-        # Each audio covers exactly 2 images — no overflow, no shared images between segments
-        img_dur = max(dur / 2.0, 1.0)   # each of the 2 images gets half the audio duration
-        baked   = []
+        # ── Each image gets exactly half the audio duration ──
+        img_dur = dur / 2.0
+
+        # ── Prepare the 2 images for this segment ──
+        baked = []
         for off in range(2):
-            idx = si * 2 + off          # 0→(0,1), 1→(2,3), ..., 9→(18,19) — exactly 20 images
-            # Guard: idx must be in [0, TOTAL_IMGS-1]
+            idx = si * 2 + off                          # 0→(0,1), 1→(2,3), …, 9→(18,19)
             idx = max(0, min(idx, TOTAL_IMGS - 1))
             src = (image_paths[idx]
                    if idx < len(image_paths) and image_paths[idx]
                    else image_paths[0])
             dst = os.path.join(sdir, f"frm_{si:02d}_{off}.jpg")
-            _prepare_image(src, dst)
+            _prepare_image(src, dst, vw, vh)
             baked.append(dst)
 
+        # ── Ken Burns — alternate direction per segment ──
         d   = "fwd" if si % 2 == 0 else "rev"
-        vf0 = _kb_vf(img_dur, d)
-        vf1 = _kb_vf(img_dur, "rev" if d == "fwd" else "fwd")
+        vf0 = _kb_vf(vw, vh, img_dur, d)
+        vf1 = _kb_vf(vw, vh, img_dur, "rev" if d == "fwd" else "fwd")
+
         clip = os.path.join(sdir, f"seg_{si:02d}.mp4")
-        filt = (f"[0:v]{vf0}[v0];[1:v]{vf1}[v1];[v0][v1]concat=n=2:v=1:a=0[vout]")
+        filt = f"[0:v]{vf0}[v0];[1:v]{vf1}[v1];[v0][v1]concat=n=2:v=1:a=0[vout]"
+
         _run_ff([ff, "-y",
-            "-loop","1","-t",f"{img_dur:.4f}","-i",baked[0],
-            "-loop","1","-t",f"{img_dur:.4f}","-i",baked[1],
-            "-i",ap, "-filter_complex",filt,
-            "-map","[vout]","-map","2:a","-t",f"{dur:.4f}",
-            "-c:v","libx264","-preset","fast","-crf","23",
-            "-pix_fmt","yuv420p","-r",str(FPS),
-            "-c:a","aac","-b:a","128k","-ar","44100","-ac","1", clip
+            "-loop", "1", "-t", f"{img_dur:.4f}", "-i", baked[0],
+            "-loop", "1", "-t", f"{img_dur:.4f}", "-i", baked[1],
+            "-i", ap,
+            "-filter_complex", filt,
+            "-map", "[vout]", "-map", "2:a",
+            "-t", f"{dur:.4f}",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-pix_fmt", "yuv420p", "-r", str(FPS),
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "1",
+            clip
         ], timeout=180)
         clips.append(clip)
-        logger.info("[%s] Segment %d/10 assembled (audio %.2fs)", session_id, si+1, dur)
+        logger.info("[%s] Segment %d/10 assembled — audio=%.2fs img_dur=%.2fs",
+                    session_id, si + 1, dur, img_dur)
 
     concat_txt = os.path.join(sdir, "concat.txt")
     with open(concat_txt, "w") as f:
@@ -738,51 +782,99 @@ def assemble_video(session_id: str, image_paths: list[str],
 
     out = os.path.join(sdir, "final_video.mp4")
     update_status(session_id, "assembling", 97, "Finalisation…")
-    _run_ff([ff,"-y","-f","concat","-safe","0","-i",concat_txt,
-             "-c:v","libx264","-preset","fast","-crf","23",
-             "-c:a","aac","-b:a","128k", out], timeout=300)
+    _run_ff([ff, "-y", "-f", "concat", "-safe", "0", "-i", concat_txt,
+             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+             "-c:a", "aac", "-b:a", "128k", out], timeout=300)
     logger.info("[%s] Final video → %s", session_id, out)
     return out
 
 
 # ---------------------------------------------------------------------------
-# Main production runner — 2 parallel threads (images + audio)
+# Bundle ZIP — everything produced during the session
 # ---------------------------------------------------------------------------
 
-def run_production(session_id: str, character_image_path: str):
+def create_bundle_zip(session_id: str) -> str:
+    """
+    Create a ZIP archive containing:
+      - original character image
+      - all generated images (image_00..19.jpg)
+      - all audio files (audio_00..09.wav)
+      - final video (final_video.mp4)
+      - session metadata (session_data.json)
+    Returns the path to the ZIP file.
+    """
+    sdir     = session_dir(session_id)
+    zip_path = os.path.join(sdir, f"bundle_{session_id[:8]}.zip")
+
+    data = load_session(session_id) or {}
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        # Session metadata
+        zf.writestr("session_data.json", json.dumps(data, ensure_ascii=False, indent=2))
+
+        # Original character image
+        char_img = data.get("character_image_path")
+        if char_img and os.path.exists(char_img):
+            zf.write(char_img, f"originals/{os.path.basename(char_img)}")
+
+        # Generated images
+        for i in range(TOTAL_IMGS):
+            p = os.path.join(sdir, f"image_{i:02d}.jpg")
+            if os.path.exists(p):
+                zf.write(p, f"images/image_{i:02d}.jpg")
+
+        # Audio files
+        for i in range(10):
+            p = os.path.join(sdir, f"audio_{i:02d}.wav")
+            if os.path.exists(p):
+                zf.write(p, f"audio/audio_{i:02d}.wav")
+
+        # Final video
+        video_path = data.get("video_path")
+        if video_path and os.path.exists(video_path):
+            zf.write(video_path, "final_video.mp4")
+
+    logger.info("[%s] Bundle ZIP created → %s", session_id, zip_path)
+    return zip_path
+
+
+# ---------------------------------------------------------------------------
+# Main production runner
+# ---------------------------------------------------------------------------
+
+def run_production(session_id: str, character_image_path: str,
+                   video_format: str = "16:9"):
     try:
         session_data = load_session(session_id)
         if not session_data:
             logger.error("[%s] Session not found", session_id)
             return
 
-        # Save character image path for potential auto-resume later
         with _status_lock:
             data = load_session(session_id) or {}
             data["character_image_path"] = character_image_path
+            data["video_format"]         = video_format
             save_session(session_id, data)
 
-        # 20 prompts: all_prompts[0..19]
         all_prompts = [p for seg in session_data["segments"] for p in seg["image_prompts"]]
-        # Ensure exactly 20 prompts
         while len(all_prompts) < TOTAL_IMGS:
-            all_prompts.append(f"WIDE SHOT - the person from the reference photo, photorealistic, 8k, cinematic")
+            all_prompts.append("WIDE SHOT - the person from the reference photo, photorealistic, 8k, cinematic")
         all_prompts = all_prompts[:TOTAL_IMGS]
 
-        lock         = threading.Lock()
-        counters     = {"img": 0, "aud": 0}
-        image_paths  = [None] * TOTAL_IMGS
+        lock        = threading.Lock()
+        counters    = {"img": 0, "aud": 0}
+        image_paths = [None] * TOTAL_IMGS
 
         update_status(session_id, "generating", 5,
-                      "2 threads démarrés : images (4 sections parallèles) • audio TTS",
+                      f"2 threads démarrés : images ({video_format}) • audio TTS",
                       images_done=[], audio_done=[])
 
         results = {"audio": None, "err_img": None, "err_aud": None}
 
         def run_img():
             try:
-                generate_all_images(session_id, character_image_path,
-                                    all_prompts, counters, lock, image_paths)
+                generate_all_images(session_id, character_image_path, all_prompts,
+                                    video_format, counters, lock, image_paths)
             except Exception as e:
                 results["err_img"] = e
                 logger.error("[%s] Images thread: %s", session_id, e, exc_info=True)
@@ -801,7 +893,7 @@ def run_production(session_id: str, character_image_path: str):
 
         audio_paths = results["audio"] or []
 
-        # Fill any None slots with character image as fallback
+        # Fill any None image slots
         last_valid = character_image_path
         for i in range(TOTAL_IMGS):
             if image_paths[i] and os.path.exists(image_paths[i]):
@@ -813,17 +905,20 @@ def run_production(session_id: str, character_image_path: str):
         logger.info("[%s] All threads done — %d images, %d audio",
                     session_id, TOTAL_IMGS, len(audio_paths))
 
-        video_path = assemble_video(
-            session_id, image_paths, audio_paths,
-            load_session(session_id) or session_data)
+        fresh_data  = load_session(session_id) or session_data
+        video_path  = assemble_video(session_id, image_paths, audio_paths, fresh_data)
 
         with _status_lock:
             data = load_session(session_id) or session_data
             data.update({
-                "status": "done", "progress": 100, "current_step": "Vidéo prête !",
-                "video_path": video_path, "video_url": f"/api/download/{session_id}",
-                "duration_seconds": 75.0, "error": None,
-                "last_heartbeat": time.time(),
+                "status":           "done",
+                "progress":         100,
+                "current_step":     "Vidéo prête !",
+                "video_path":       video_path,
+                "video_url":        f"/api/download/{session_id}",
+                "duration_seconds": 75.0,
+                "error":            None,
+                "last_heartbeat":   time.time(),
             })
             save_session(session_id, data)
 

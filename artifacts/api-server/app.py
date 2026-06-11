@@ -11,6 +11,7 @@ from pipeline import (
     update_status, run_production,
     session_dir, find_character_image,
     auto_resume_stalled_sessions,
+    create_bundle_zip,
     SESSIONS_DIR,
 )
 
@@ -65,29 +66,34 @@ def produce_video(session_id: str):
     if "character_image" not in request.files:
         return jsonify({"error": "Missing character_image file"}), 400
 
+    # Read video format (default 16:9)
+    video_format = "16:9"
+    if request.form.get("video_format") in ("16:9", "9:16"):
+        video_format = request.form.get("video_format")
+
     image_file = request.files["character_image"]
     import uuid as _uuid
     char_path = os.path.join(session_dir(session_id),
                              f"character_{_uuid.uuid4().hex}.jpg")
     image_file.save(char_path)
-    logger.info("Character image saved: %s", char_path)
+    logger.info("Character image saved: %s | format: %s", char_path, video_format)
 
     update_status(session_id, "pending", 0,
-                  "Démarrage de la production (3 threads en parallèle)…",
+                  f"Démarrage de la production ({video_format})…",
                   images_done=[], audio_done=[],
-                  character_image_path=char_path)
+                  character_image_path=char_path,
+                  video_format=video_format)
 
-    threading.Thread(target=run_production, args=(session_id, char_path), daemon=True).start()
+    threading.Thread(
+        target=run_production,
+        args=(session_id, char_path, video_format),
+        daemon=True
+    ).start()
     return jsonify({"session_id": session_id, "status": "pending"}), 202
 
 
 @app.route("/api/resume/<session_id>", methods=["POST"])
 def resume_session(session_id: str):
-    """
-    Restart production for a session that was interrupted (e.g. server restarted).
-    If the session is already running (recent heartbeat) this is a no-op.
-    If no character image exists, returns 409 so the frontend can prompt the user.
-    """
     data = load_session(session_id)
     if not data:
         return jsonify({"error": "Session not found"}), 404
@@ -98,7 +104,6 @@ def resume_session(session_id: str):
     if status == "error":
         return jsonify({"status": "error", "message": data.get("error")}), 200
 
-    # Check heartbeat — if recent, production is still running
     hb = data.get("last_heartbeat", 0)
     if time.time() - hb < 120:
         return jsonify({"status": status, "message": "Production already running"}), 200
@@ -108,12 +113,17 @@ def resume_session(session_id: str):
         return jsonify({"error": "no_character_image",
                         "message": "Character image not found — please upload again"}), 409
 
-    logger.info("Resuming session %s (status was %s)", session_id, status)
+    video_format = data.get("video_format", "16:9")
+    logger.info("Resuming session %s (status was %s, format=%s)", session_id, status, video_format)
     update_status(session_id, "pending", data.get("progress", 0),
                   "Reprise de la production…",
                   images_done=data.get("images_done", []),
                   audio_done=data.get("audio_done", []))
-    threading.Thread(target=run_production, args=(session_id, char_img), daemon=True).start()
+    threading.Thread(
+        target=run_production,
+        args=(session_id, char_img, video_format),
+        daemon=True
+    ).start()
     return jsonify({"status": "resuming", "message": "Production restarted"}), 202
 
 
@@ -147,6 +157,7 @@ def get_result(session_id: str):
         "hashtags":         data.get("hashtags",         []),
         "video_url":        f"/api/download/{session_id}",
         "duration_seconds": data.get("duration_seconds", 75.0),
+        "video_format":     data.get("video_format",     "16:9"),
     }), 200
 
 
@@ -195,6 +206,22 @@ def download_video(session_id: str):
     if not vp or not os.path.exists(vp): abort(404)
     return send_file(vp, mimetype="video/mp4", as_attachment=False,
                      download_name=f"video_{session_id[:8]}.mp4")
+
+
+@app.route("/api/download-bundle/<session_id>")
+def download_bundle(session_id: str):
+    """Return a ZIP bundle with all session files."""
+    data = load_session(session_id)
+    if not data: abort(404)
+    if data.get("status") != "done":
+        return jsonify({"error": "Production not complete yet"}), 400
+    try:
+        zip_path = create_bundle_zip(session_id)
+    except Exception as e:
+        logger.error("Bundle ZIP error for %s: %s", session_id, e, exc_info=True)
+        return jsonify({"error": str(e)}), 500
+    return send_file(zip_path, mimetype="application/zip", as_attachment=True,
+                     download_name=f"bundle_{session_id[:8]}.zip")
 
 
 # ---------------------------------------------------------------------------
