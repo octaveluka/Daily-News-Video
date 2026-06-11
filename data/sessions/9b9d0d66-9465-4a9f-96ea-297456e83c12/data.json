@@ -1,0 +1,121 @@
+{
+  "session_id": "9b9d0d66-9465-4a9f-96ea-297456e83c12",
+  "created_at": "2026-06-10T21:12:57.302996",
+  "topic": "La France est bouleversée par l’émotion autour de la mort de la jeune Lyhanna, dont les obsèques auront lieu vendredi dans la plus stricte intimité.",
+  "title": "Le silence qui serre toute une nation",
+  "description": "Dans une ville figée, chacun retient son souffle en pensant à Lyhanna. Son absence pèse comme une ombre trop lourde pour un si petit cercueil.",
+  "hashtags": [
+    "#Lyhanna",
+    "#Hommage",
+    "#Émotion",
+    "#FranceUnie",
+    "#Mémoire"
+  ],
+  "segments": [
+    {
+      "index": 0,
+      "text": "La nouvelle traverse la rue comme un vent glacé, et les passants s’arrêtent, le cœur soudain trop lourd.",
+      "image_prompts": [
+        "WIDE ESTABLISHING SHOT - petite ville française sous un ciel pâle - golden hour - drapeaux immobiles aux fenêtres - atmosphère suspendue - photorealistic, 8k, cinematic",
+        "EXTREME CLOSE-UP - main crispée sur un téléphone affichant la photo de Lyhanna - candlelight - lueur tremblante sur la peau - émotion contenue - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 1,
+      "text": "Devant l’école, une mère serre son écharpe, comme pour retenir un sanglot qui menace de la briser.",
+      "image_prompts": [
+        "LOW ANGLE SHOT - façade d’école silencieuse, jouets abandonnés - dawn mist - feuilles humides collées au sol - tension sourde - photorealistic, 8k, cinematic",
+        "AERIAL VIEW - quartier endormi, rues vides, bouquets déposés - blue hour - taches colorées des fleurs - recueillement collectif - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 2,
+      "text": "Un voisin raconte qu’il entend encore son rire filer entre les immeubles, comme un écho qui refuse de partir.",
+      "image_prompts": [
+        "CLOSE-UP - fenêtre entrouverte donnant sur une cour déserte - golden hour - rideau qui bouge légèrement - nostalgie poignante - photorealistic, 8k, cinematic",
+        "WIDE SHOT - immeubles serrés, ombres longues - dramatic storm light - ballon oublié au sol - silence pesant - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 3,
+      "text": "Dans la cuisine, le père tourne une tasse vide, incapable de boire, incapable de parler, juste là, immobile.",
+      "image_prompts": [
+        "OVER-THE-SHOULDER - homme assis à table, tasse entre les doigts - interior intimate - lumière froide du matin - solitude écrasante - photorealistic, 8k, cinematic",
+        "EXTREME CLOSE-UP - vapeur absente d’une tasse froide - harsh noon - reflet tremblant d’un visage - vertige émotionnel - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 4,
+      "text": "La chambre de Lyhanna reste intacte, ses crayons alignés, son carnet ouvert sur un dessin inachevé.",
+      "image_prompts": [
+        "CLOSE-UP - crayons de couleur sur un bureau d’enfant - dawn mist - poussière dans la lumière - innocence figée - photorealistic, 8k, cinematic",
+        "WIDE SHOT - petite chambre rose, lit soigneusement fait - golden hour - peluche tournée vers la porte - absence déchirante - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 5,
+      "text": "Dans la rue, des inconnus déposent une rose, murmurant son prénom comme pour qu’il ne s’efface jamais.",
+      "image_prompts": [
+        "LOW ANGLE SHOT - roses alignées contre un mur - candlelight - cire fondue au sol - recueillement profond - photorealistic, 8k, cinematic",
+        "CLOSE-UP - pétale froissé entre deux doigts - neon glow - lueur rose sur la peau - fragilité humaine - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 6,
+      "text": "Le cortège se prépare, discret, presque invisible, comme si chacun craignait de troubler son dernier voyage.",
+      "image_prompts": [
+        "WIDE SHOT - petite église de village, portes closes - dawn mist - silhouettes immobiles - gravité silencieuse - photorealistic, 8k, cinematic",
+        "AERIAL SHOT - chemin menant au cimetière, arbres immobiles - blue hour - ruban blanc sur un portail - pudeur collective - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 7,
+      "text": "Une amie d’enfance serre un bracelet d’amitié, celui qu’elles avaient noué ensemble un été trop court.",
+      "image_prompts": [
+        "EXTREME CLOSE-UP - bracelet tressé serré dans une main - golden hour - larmes sur la peau - souvenir brûlant - photorealistic, 8k, cinematic",
+        "OVER-THE-SHOULDER - jeune fille regardant le sol, bracelet visible - dramatic storm light - ombre longue derrière elle - douleur muette - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 8,
+      "text": "Le cercueil avance lentement, porté par des bras tremblants, et l’air semble retenir sa propre respiration.",
+      "image_prompts": [
+        "WIDE SHOT - procession avançant entre les tombes - dawn mist - fleurs blanches qui oscillent - solennité profonde - photorealistic, 8k, cinematic",
+        "LOW ANGLE SHOT - pas hésitants sur le gravier - golden hour - poussière soulevée - fragilité du moment - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 9,
+      "text": "Quand la dernière poignée de terre retombe, un souffle d’espoir murmure que son nom vivra encore longtemps.",
+      "image_prompts": [
+        "SILHOUETTE SHOT - silhouette d’enfant face au ciel clair - blue hour - vent léger dans les cheveux - espoir fragile - photorealistic, 8k, cinematic",
+        "CLOSE-UP PORTRAIT - visage apaisé éclairé par une lueur douce - golden hour - reflet humide dans les yeux - sérénité retrouvée - photorealistic, 8k, cinematic"
+      ]
+    }
+  ],
+  "status": "generating",
+  "progress": 15,
+  "current_step": "Images 7/20 • Audio 10/10 en parallèle...",
+  "images_done": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "audio_done": [
+    1,
+    0,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "error": null
+}

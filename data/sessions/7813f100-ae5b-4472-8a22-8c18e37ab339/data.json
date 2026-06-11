@@ -1,0 +1,102 @@
+{
+  "session_id": "7813f100-ae5b-4472-8a22-8c18e37ab339",
+  "created_at": "2026-06-10T20:46:01.010855",
+  "topic": "L’Iran a abattu un hélicoptère américain dans le détroit d’Ormuz, ravivant la crainte d’une escalade dramatique.",
+  "title": "L’hélicoptère tombe, le monde retient son souffle",
+  "description": "Dans le vacarme du détroit d’Ormuz, un tir déchire la nuit et bouleverse des vies. Au loin, des familles sentent déjà la tempête approcher.",
+  "hashtags": [
+    "#Ormuz",
+    "#Tension",
+    "#FrontièreFragile",
+    "#HistoireEnCours",
+    "#Humanité"
+  ],
+  "segments": [
+    {
+      "index": 0,
+      "text": "Le rotor hurle dans la nuit quand une lueur surgit, fendant l’air comme un avertissement brûlant.",
+      "image_prompts": [
+        "WIDE ESTABLISHING SHOT - détroit d’Ormuz balayé par le vent nocturne - blue hour - un hélicoptère minuscule au-dessus des vagues sombres - tension électrique - photorealistic, 8k, cinematic",
+        "EXTREME CLOSE-UP - cockpit vibrant sous les alarmes rouges - harsh neon glow - gouttes de sueur sur une joue crispée - urgence viscérale - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 1,
+      "text": "Le tir frappe, l’appareil vacille, et le pilote serre les dents en sentant le métal gémir sous lui.",
+      "image_prompts": [
+        "LOW ANGLE SHOT - silhouette de l’hélicoptère en chute contre un ciel noir - dramatic storm light - fumée déchirée - vertige brutal - photorealistic, 8k, cinematic",
+        "AERIAL VIEW - éclats de débris tombant vers la mer agitée - dawn mist - traînée de feu vacillante - chaos suspendu - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 2,
+      "text": "Sur un navire voisin, un marin lève les yeux, la gorge serrée, incapable de croire ce qu’il voit.",
+      "image_prompts": [
+        "OVER-THE-SHOULDER SHOT - pont métallique trempé - golden hour mourante - main crispée sur une rambarde froide - stupeur muette - photorealistic, 8k, cinematic",
+        "CLOSE-UP - yeux écarquillés reflétant la boule de feu lointaine - candlelight artificielle - souffle coupé - effroi intime - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 3,
+      "text": "À terre, une opératrice radio écoute le silence soudain, son casque vibrant encore du dernier message brisé.",
+      "image_prompts": [
+        "INTERIOR CLOSE-UP - salle de communication exiguë - neon glow - doigts tremblants sur un bouton d’écoute - tension sourde - photorealistic, 8k, cinematic",
+        "DUTCH ANGLE - câbles et écrans clignotants - harsh noon artificial - signal perdu affiché en rouge - déséquilibre émotionnel - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 4,
+      "text": "Dans un village iranien, un pêcheur voit la lueur au loin et murmure que la mer réclame toujours son dû.",
+      "image_prompts": [
+        "WIDE SHOT - rivage rocheux iranien - dawn mist - barque tirée sur le sable humide - fatalisme ancien - photorealistic, 8k, cinematic",
+        "LOW ANGLE - silhouette du pêcheur face à l’horizon rougeoyant - golden hour - filet abandonné à ses pieds - pressentiment lourd - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 5,
+      "text": "Les radios s’enflamment, les voix se chevauchent, chacun cherchant à comprendre ce qui vient de basculer.",
+      "image_prompts": [
+        "CROWDED INTERIOR SHOT - poste de commandement encombré - neon glow - cartes froissées et écrans saturés - agitation nerveuse - photorealistic, 8k, cinematic",
+        "CLOSE-UP - main écrivant frénétiquement sur un carnet - candlelight - encre qui bave sous la hâte - urgence palpable - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 6,
+      "text": "Dans une maison américaine, une mère fixe son téléphone, priant pour un message qui ne vient pas.",
+      "image_prompts": [
+        "INTIMATE INTERIOR SHOT - salon plongé dans la pénombre - blue hour - téléphone éclairant un visage inquiet - attente douloureuse - photorealistic, 8k, cinematic",
+        "EXTREME CLOSE-UP - doigts serrant un pendentif militaire - candlelight - tremblement imperceptible - amour suspendu - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 7,
+      "text": "Au même instant, un jeune soldat iranien observe la mer, persuadé d’avoir déclenché quelque chose qui le dépasse.",
+      "image_prompts": [
+        "LOW ANGLE SHOT - poste côtier en béton fissuré - harsh noon - ombre du soldat étirée sur le sol - culpabilité diffuse - photorealistic, 8k, cinematic",
+        "WIDE SHOT - mer sombre frappant les rochers - dramatic storm light - fusil posé contre un mur - silence écrasant - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 8,
+      "text": "Le monde retient son souffle, chaque camp attendant le geste de trop, le mot qui ferait exploser la nuit.",
+      "image_prompts": [
+        "AERIAL SHOT - détroit d’Ormuz vu d’en haut - golden hour - navires dispersés comme des pions immobiles - menace latente - photorealistic, 8k, cinematic",
+        "SILHOUETTE WIDE SHOT - deux navires face à face dans la brume - dawn mist - tension figée - calme précaire - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 9,
+      "text": "Et dans ce silence tendu, une prière s’élève, fragile, espérant que la mer n’engloutisse pas l’avenir.",
+      "image_prompts": [
+        "SILHOUETTE SHOT - figure solitaire sur un quai désert - blue hour - mains jointes contre le vent - espoir ténu - photorealistic, 8k, cinematic",
+        "CLOSE-UP PORTRAIT - visage éclairé par une lueur douce - candlelight - larme suspendue - humanité persistante - photorealistic, 8k, cinematic"
+      ]
+    }
+  ],
+  "status": "pending",
+  "progress": 0,
+  "current_step": "Script généré. En attente de l'image du personnage.",
+  "images_done": [],
+  "audio_done": [],
+  "error": null
+}

@@ -1,0 +1,137 @@
+{
+  "session_id": "8e4907c9-477a-4033-8e4f-309e01ef09f6",
+  "created_at": "2026-06-10T20:55:43.063535",
+  "topic": "L’attaque de drones revendiquée par l’Iran contre une base américaine à Bahreïn bouleverse le monde aujourd’hui.",
+  "title": "La nuit où le ciel de Bahreïn s’ouvre",
+  "description": "Une base américaine s’embrase sous un ciel déchiré par des drones. Au milieu du chaos, des vies basculent en un souffle.",
+  "hashtags": [
+    "#Bahreïn",
+    "#Attaque",
+    "#Tension",
+    "#RécitHumain",
+    "#BreakingStory"
+  ],
+  "segments": [
+    {
+      "index": 0,
+      "text": "Le sol vibre quand Karim lève les yeux, persuadé que le ciel vient de se fendre en deux.",
+      "image_prompts": [
+        "WIDE ESTABLISHING SHOT - base militaire de Bahreïn entourée de sable et de hangars - golden hour - fumée montant derrière les bâtiments - atmosphère de stupeur et d’urgence - photorealistic, 8k, cinematic",
+        "EXTREME CLOSE-UP - éclat de lumière reflété dans l’œil d’un soldat - harsh noon - poussière collée aux cils - tension électrique - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 1,
+      "text": "Un grondement traverse l’air tandis que Sarah court entre les abris, son souffle court et brûlant.",
+      "image_prompts": [
+        "LOW ANGLE SHOT - silhouettes de soldats courant entre des containers métalliques - dramatic storm light - éclats d’étincelles tombant du ciel - chaos imminent - photorealistic, 8k, cinematic",
+        "AERIAL VIEW - base américaine vue du dessus, panache de fumée noire s’élevant - dawn mist - drones en approche lointaine - menace palpable - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 2,
+      "text": "Le premier impact secoue tout, projetant des éclats de métal qui sifflent autour de Tom.",
+      "image_prompts": [
+        "CLOSE-UP - mains couvertes de poussière agrippant un mur de béton fissuré - blue hour - vibrations visibles dans les doigts - peur contenue - photorealistic, 8k, cinematic",
+        "WIDE SHOT - explosion illuminant un parking militaire désert - neon glow - véhicules renversés - violence soudaine - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 3,
+      "text": "Dans le vacarme, une voix crie un prénom, déchirée par l’inquiétude et la fumée.",
+      "image_prompts": [
+        "OVER-THE-SHOULDER - soldat cherchant un camarade dans un couloir enfumé - candlelight - ombres mouvantes - urgence désespérée - photorealistic, 8k, cinematic",
+        "LOW ANGLE - débris tombant d’un toit métallique en flammes - harsh noon - étincelles autour - danger imminent - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 4,
+      "text": "Karim trébuche sur un casque abandonné, encore chaud, comme si son propriétaire venait de disparaître.",
+      "image_prompts": [
+        "CLOSE-UP - casque militaire fumant posé sur le sol sableux - dawn mist - trace de main dessus - silence lourd - photorealistic, 8k, cinematic",
+        "WIDE SHOT - hangar éventré laissant entrer la lumière bleutée du matin - blue hour - poussière en suspension - désolation - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 5,
+      "text": "Sarah aperçoit un drone en piqué, son ventre se noue tandis qu’elle hurle de se mettre à couvert.",
+      "image_prompts": [
+        "DUTCH ANGLE - drone plongeant entre deux tours de surveillance - dramatic storm light - traînée lumineuse - menace écrasante - photorealistic, 8k, cinematic",
+        "AERIAL SHOT - silhouettes courant vers un bunker - golden hour - ombres longues - panique organisée - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 6,
+      "text": "Tom rampe sous un camion renversé, ses mains tremblent en cherchant son radio brisé.",
+      "image_prompts": [
+        "EXTREME CLOSE-UP - doigts ensanglantés serrant un talkie-walkie fissuré - candlelight - gouttes de sueur - désespoir - photorealistic, 8k, cinematic",
+        "LOW ANGLE - camion militaire couché sur le flanc - harsh noon - fumée s’échappant du moteur - chaos mécanique - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 7,
+      "text": "Un souffle d’explosion projette Sarah au sol, ses oreilles bourdonnent comme si le monde se dissolvait.",
+      "image_prompts": [
+        "WIDE SHOT - vague de choc traversant un terrain sablonneux - dramatic storm light - silhouettes projetées - puissance brute - photorealistic, 8k, cinematic",
+        "CLOSE-UP - visage couvert de poussière, yeux écarquillés, sonné - dawn mist - grains de sable collés à la peau - confusion totale - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 8,
+      "text": "Karim retrouve enfin Tom, le tire par le bras et l’entraîne vers un abri encore debout.",
+      "image_prompts": [
+        "OVER-THE-SHOULDER - deux soldats courant vers un bunker éclairé par une lampe rouge - neon glow - fumée derrière eux - survie instinctive - photorealistic, 8k, cinematic",
+        "WIDE SHOT - bunker isolé au milieu du sable noirci - blue hour - portes entrouvertes - refuge fragile - photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 9,
+      "text": "Quand la poussière retombe, Sarah se relève lentement, jurant que cette nuit ne les brisera pas.",
+      "image_prompts": [
+        "SILHOUETTE SHOT - silhouette debout sur un sol calciné face au soleil levant - golden hour - fumée dissipée - résilience - photorealistic, 8k, cinematic",
+        "CLOSE-UP PORTRAIT - visage marqué mais déterminé, éclairé par la lumière douce du matin - dawn mist - regard fixe - espoir tenace - photorealistic, 8k, cinematic"
+      ]
+    }
+  ],
+  "status": "done",
+  "progress": 100,
+  "current_step": "Vidéo prête !",
+  "images_done": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19
+  ],
+  "audio_done": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "error": null,
+  "video_path": "/home/runner/workspace/data/sessions/8e4907c9-477a-4033-8e4f-309e01ef09f6/final_video.mp4",
+  "video_url": "/api/download/8e4907c9-477a-4033-8e4f-309e01ef09f6",
+  "duration_seconds": 75.0
+}

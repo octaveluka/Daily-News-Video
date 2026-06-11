@@ -1,0 +1,102 @@
+{
+  "session_id": "4b5852e2-ec8e-4a42-a485-392a44f61b42",
+  "created_at": "2026-06-11T07:50:38.445368",
+  "topic": "Test topic",
+  "title": "L’énigme silencieuse du Test Topic",
+  "description": "Une enquête révèle comment un phénomène apparemment anodin, surnommé « Test Topic », s’est transformé en sujet d’inquiétude pour chercheurs et institutions. Au fil des témoignages, un réseau d’enjeux ",
+  "hashtags": [
+    "#Enquête",
+    "#Documentaire",
+    "#Société",
+    "#Analyse",
+    "#Monde"
+  ],
+  "segments": [
+    {
+      "index": 0,
+      "text": "Depuis plusieurs mois, le terme « Test Topic » circule dans les rapports internes de plusieurs organisations internationales, évoqué comme un phénomène émergent dont personne ne parvient à définir clairement l’origine. Des analystes parlent d’un signal faible devenu trop visible pour être ignoré.",
+      "image_prompts": [
+        "WIDE ESTABLISHING SHOT - the person from the reference photo observing un centre de recherche international à Genève, lumière froide du matin, photorealistic, 8k, cinematic",
+        "AERIAL VIEW - the person from the reference photo near un complexe administratif entouré de bâtiments modernes, lumière diffuse, photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 1,
+      "text": "Les premières mentions officielles remontent à une réunion confidentielle tenue à Bruxelles, où un conseiller européen aurait déclaré : « Nous avons sous-estimé l’impact du Test Topic sur nos chaînes d’information. » Depuis, les institutions tentent de comprendre son expansion rapide.",
+      "image_prompts": [
+        "CLOSE-UP PORTRAIT - the person from the reference photo dans une salle de conférence européenne, lumière artificielle blanche, photorealistic, 8k, cinematic",
+        "LOW ANGLE SHOT - the person from the reference photo devant le Parlement européen à Bruxelles, ciel couvert, photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 2,
+      "text": "Dans plusieurs capitales, des journalistes d’investigation affirment que le Test Topic serait lié à une série de décisions stratégiques prises en coulisses par des acteurs privés. Une reporter basée à Berlin évoque « un puzzle dont les pièces semblent volontairement dispersées ». ",
+      "image_prompts": [
+        "OVER-THE-SHOULDER - the person from the reference photo consultant des dossiers dans une rédaction berlinoise, néons froids, photorealistic, 8k, cinematic",
+        "TRACKING SHOT - the person from the reference photo marchant dans un couloir de newsroom moderne à Berlin, lumière bleutée, photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 3,
+      "text": "À Nairobi, un chercheur en communication numérique explique que le Test Topic aurait d’abord été observé dans des communautés en ligne marginalisées, avant de se propager vers des espaces plus institutionnels. Il décrit un phénomène « organique, mais amplifié par des intérêts inattendus ». ",
+      "image_prompts": [
+        "MEDIUM SHOT - the person from the reference photo discutant avec un chercheur dans un campus universitaire de Nairobi, lumière chaude de fin d’après-midi, photorealistic, 8k, cinematic",
+        "POV SHOT - the person from the reference photo regardant des écrans affichant des cartes de réseaux sociaux dans un laboratoire africain, lumière tamisée, photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 4,
+      "text": "À mesure que l’enquête progresse, plusieurs gouvernements reconnaissent avoir lancé des audits internes. Un porte-parole à Ottawa admet : « Nous ne savons pas encore si le Test Topic représente une opportunité ou une menace. » Cette incertitude alimente les spéculations.",
+      "image_prompts": [
+        "TWO-SHOT - the person from the reference photo aux côtés d’un porte-parole gouvernemental dans un centre de presse canadien, lumière neutre, photorealistic, 8k, cinematic",
+        "DUTCH ANGLE - the person from the reference photo dans un couloir gouvernemental d’Ottawa, lumière fluorescente, photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 5,
+      "text": "Des documents obtenus par une ONG londonienne révèlent que plusieurs entreprises technologiques auraient anticipé l’émergence du Test Topic dès l’année précédente. Un analyste affirme que « certains acteurs savaient, mais n’ont rien communiqué publiquement ». Les motivations restent floues.",
+      "image_prompts": [
+        "EXTREME CLOSE-UP - the person from the reference photo examinant un document confidentiel dans un bureau londonien, lumière de lampe de bureau, photorealistic, 8k, cinematic",
+        "SILHOUETTE SHOT - the person from the reference photo devant les tours de Canary Wharf au crépuscule, contre-jour, photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 6,
+      "text": "À São Paulo, des activistes affirment que le Test Topic a déjà des conséquences sociales tangibles, notamment dans les quartiers périphériques où des initiatives citoyennes tentent d’en comprendre les implications. Une militante déclare : « Ce n’est plus un concept abstrait, c’est notre quotidien. »",
+      "image_prompts": [
+        "LOW ANGLE SHOT - the person from the reference photo dans une rue animée de São Paulo, lumière dure du midi, photorealistic, 8k, cinematic",
+        "WIDE ESTABLISHING SHOT - the person from the reference photo observant un quartier périphérique de São Paulo depuis une colline, lumière dorée, photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 7,
+      "text": "Les tensions montent lorsque plusieurs rapports contradictoires émergent, certains affirmant que le Test Topic serait instrumentalisé par des groupes politiques. À New Delhi, un expert en gouvernance parle d’un « terrain glissant où chacun tente de tirer avantage du flou ». ",
+      "image_prompts": [
+        "OVER-THE-SHOULDER - the person from the reference photo assistant à une conférence sur la gouvernance à New Delhi, lumière chaude intérieure, photorealistic, 8k, cinematic",
+        "AERIAL VIEW - the person from the reference photo au-dessus d’un quartier administratif de New Delhi, lumière brumeuse du matin, photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 8,
+      "text": "Le point culminant survient lorsqu’un consortium indépendant publie une synthèse reliant le Test Topic à une série d’événements économiques mondiaux. Les conclusions, bien que prudentes, évoquent un phénomène révélateur des fragilités systémiques actuelles.",
+      "image_prompts": [
+        "MEDIUM SHOT - the person from the reference photo dans une salle de conférence où un rapport est présenté, lumière blanche uniforme, photorealistic, 8k, cinematic",
+        "CLOSE-UP PORTRAIT - the person from the reference photo réagissant à la publication du rapport dans un centre d’analyse économique, lumière froide, photorealistic, 8k, cinematic"
+      ]
+    },
+    {
+      "index": 9,
+      "text": "Alors que les institutions commencent à coordonner leurs réponses, une conclusion s’impose : le Test Topic n’est pas un incident isolé, mais un révélateur des interconnexions globales. Un chercheur résume : « Ce phénomène nous oblige à repenser nos cadres d’analyse. »",
+      "image_prompts": [
+        "TRACKING SHOT - the person from the reference photo traversant un centre de coordination international, lumière blanche diffuse, photorealistic, 8k, cinematic",
+        "SILHOUETTE SHOT - the person from the reference photo devant une grande baie vitrée donnant sur une ville mondiale, lumière du soir, photorealistic, 8k, cinematic"
+      ]
+    }
+  ],
+  "status": "pending",
+  "progress": 0,
+  "current_step": "Script généré — en attente de l'image du personnage.",
+  "images_done": [],
+  "audio_done": [],
+  "error": null
+}

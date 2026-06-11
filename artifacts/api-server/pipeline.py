@@ -1,9 +1,12 @@
 """
 V-CTRL — Video generation pipeline
-  Phase 1 : fetch news or use custom topic → 10-segment NARRATIVE script + 20 image prompts
-  Phase 2 : images (chained sequential) + audio (parallel, with retry) run SIMULTANEOUSLY
-  Phase 3 : pure ffmpeg assembly — Ken Burns via scale+crop, subtitles via PIL
-Audio note: Gemini TTS returns raw PCM (24 kHz, 16-bit, mono) — we wrap it in WAV.
+  Phase 1 : fetch news / custom topic → 10-segment DOCUMENTARY script + 20 image prompts
+  Phase 2 : images (chained sequential) + audio (parallel, validated, retry) run SIMULTANEOUSLY
+  Phase 3 : pure ffmpeg assembly — Ken Burns, burned subtitles via PIL
+
+Narrative style: journalistic documentary (Al Jazeera / Vice News), NOT character-movement fiction.
+Image prompts: every prompt explicitly places THE CHARACTER from the reference photo in the scene.
+Audio: WAV duration validated after each TTS call; re-generated if empty/silent.
 """
 
 import io
@@ -31,11 +34,25 @@ logger = logging.getLogger(__name__)
 # Paths & constants
 # ---------------------------------------------------------------------------
 
-SESSIONS_DIR = os.path.join(
+# In development: data/sessions/ at the workspace root (persistent).
+# In production: /tmp/sessions/ (writable, but ephemeral — resets on restart).
+# Override with SESSIONS_DIR env var if needed.
+_default_sessions_dir = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "data", "sessions",
 )
-os.makedirs(SESSIONS_DIR, exist_ok=True)
+SESSIONS_DIR = os.environ.get("SESSIONS_DIR", _default_sessions_dir)
+# Fallback to /tmp if the default path is not writable (e.g. production container)
+try:
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    # quick write test
+    _test = os.path.join(SESSIONS_DIR, ".write_test")
+    with open(_test, "w") as _f:
+        _f.write("ok")
+    os.remove(_test)
+except OSError:
+    SESSIONS_DIR = "/tmp/v_ctrl_sessions"
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 TEXT_API_URL   = "https://delfaapiai.vercel.app/ai/copilot"
 IMAGE_EDIT_URL = "https://gem-tw6a.onrender.com/edit"
@@ -132,10 +149,10 @@ def update_status(session_id: str, status: str, progress: int,
 
 
 # ---------------------------------------------------------------------------
-# Phase 1 — Narrative brain
+# Phase 1 — Script generation (documentary / journalistic style)
 # ---------------------------------------------------------------------------
 
-def _call_text_api(message: str, timeout: int = 60) -> str:
+def _call_text_api(message: str, timeout: int = 90) -> str:
     resp = requests.get(
         TEXT_API_URL,
         params={"message": message, "model": "default"},
@@ -171,103 +188,157 @@ def _extract_json(text: str) -> dict:
     raise ValueError(f"No JSON found: {text[:200]}")
 
 
-_NARRATIVE_SYSTEM = """Tu es un journaliste-narrateur primé qui écrit des récits humains et émouvants pour des vidéos virales en français.
+# ─── THE SINGLE MOST IMPORTANT PROMPT ────────────────────────────────────────
+# Style cible : documentaire journalistique (Al Jazeera, Vice, France 24).
+# Raconter des FAITS, des CONTEXTES, des ÉVÉNEMENTS — jamais les états d'âme
+# ni les gestes physiques de personnages fictifs.
+# ─────────────────────────────────────────────────────────────────────────────
 
-RÈGLES ABSOLUES :
-1. Chaque segment = une scène narrative vivante, avec des personnages, des émotions, des actions concrètes.
-2. INTERDIT : statistiques, descriptions froides, "le gouvernement annonce", "selon les experts".
-3. OBLIGATOIRE : verbes d'action au présent, sensations physiques, détails précis, tension narrative.
-4. Le récit doit progresser comme un film : accroche émotionnelle → développement → tension → climax → dénouement.
-5. Utilise le discours indirect libre, les citations, les images fortes.
+_NARRATIVE_SYSTEM = """Tu es le narrateur d'un documentaire journalistique de haut niveau (style Al Jazeera / Vice News / France 24).
+Tu écris en français, sur un sujet donné, un récit en 10 segments pour une vidéo narrative virale.
 
-STYLE À IMITER (exemple) :
-"Hassan saisit la lettre avec des mains tremblantes. Trente ans de silence venaient de prendre fin."
-"Sur le pont, le vieux capitaine regarde l'horizon pour la dernière fois. Il le sait."
-"Elle traverse la porte lentement. De son plein gré. Sans chaînes. Pour la première fois."
+═══════════════════════════════════════════
+RÈGLE N°1 — STYLE DOCUMENTAIRE UNIQUEMENT
+═══════════════════════════════════════════
+Chaque segment doit décrire :
+  • Des FAITS concrets, des ÉVÉNEMENTS réels ou plausibles
+  • Des CONTEXTES historiques, géopolitiques, sociaux
+  • Des CITATIONS de personnes impliquées (inventées mais crédibles)
+  • Des CONSÉQUENCES, des ENJEUX, des RETOURNEMENTS de situation
 
-STYLE À ÉVITER :
-"Les statistiques montrent une augmentation de 40%."
-"Des experts estiment que la situation pourrait évoluer."
-"La scène montre un personnage qui..."
+═══════════════════════════════════════════
+RÈGLE N°2 — CE QUI EST STRICTEMENT INTERDIT
+═══════════════════════════════════════════
+❌ Décrire les gestes, mouvements ou sensations physiques d'un personnage fictif
+   Mauvais : "Elle ouvre les yeux. Ses mains tremblent. Il respire profondément."
+❌ Narrer des états d'âme internes ("il se sent", "elle ressent", "son cœur bat")
+❌ Raconter comme un roman ("il se leva et marcha vers la fenêtre")
+❌ Statistiques froides sans contexte humain
+❌ Bullet points, listes, titres
 
-PROMPTS IMAGE — chaque prompt doit être TRÈS DIFFÉRENT des autres (varier systématiquement) :
-- Le TYPE DE PLAN : WIDE SHOT, CLOSE-UP, EXTREME CLOSE-UP, AERIAL SHOT, LOW ANGLE, SILHOUETTE, OVER-THE-SHOULDER, DUTCH ANGLE
-- LA LUMIÈRE : golden hour, harsh noon, candlelight, neon glow, blue hour, dramatic storm light, dawn mist
-- LE CADRE : interior intimate, exterior epic, urban decay, lush nature, sparse desert, crowded market, empty corridor
-- LE SUJET : visage, mains, foule, objet symbolique, paysage, reflet dans l'eau, ombre portée
-Format prompt : "[TYPE DE PLAN] - [DÉCOR PRÉCIS] - [HEURE/LUMIÈRE] - [DÉTAIL CLEF] - [AMBIANCE] - photorealistic, 8k, cinematic"
-"""
+═══════════════════════════════════════════
+EXEMPLE PARFAIT À IMITER
+═══════════════════════════════════════════
+"Depuis quelque temps, un mouvement inédit et profondément émouvant prend de l'ampleur. À la suite du vote d'une loi historique permettant d'accorder la nationalité béninoise aux afro-descendants, de nombreuses personnes venues d'Haïti, des Caraïbes et des Amériques font le voyage pour renouer avec leurs racines."
+
+"L'un des récits les plus poignants est celui de ces visiteurs qui se retrouvent face à la célèbre Porte du Non-Retour à Ouidah. Historiquement, ce monument commémore la tragédie de plus d'un million de personnes arrachées à leur terre et à leur culture."
+
+"Aujourd'hui, l'histoire s'inverse. Une jeune femme venue déposer sa demande de nationalité a récemment témoigné de ce bouleversement en traversant ce lieu de mémoire : 'Aujourd'hui, je franchis la porte, mais de mon plein gré. Volontairement. Je ne suis pas enchaînée.'"
+
+═══════════════════════════════════════════
+RÈGLE N°3 — PROMPTS IMAGE (TRÈS IMPORTANT)
+═══════════════════════════════════════════
+Chaque prompt image DOIT :
+1. Commencer par le TYPE DE PLAN en majuscules
+2. Mentionner explicitement "the person from the reference photo" pour que le personnage apparaisse
+3. Décrire précisément le LIEU, le DÉCOR et la LUMIÈRE qui CORRESPONDENT aux paroles du segment
+4. Varier FORTEMENT chaque prompt (pas deux fois le même type de plan ou décor)
+
+TYPES DE PLANS À UTILISER (chaque prompt = un type différent) :
+WIDE ESTABLISHING SHOT | CLOSE-UP PORTRAIT | EXTREME CLOSE-UP | AERIAL VIEW |
+LOW ANGLE SHOT | OVER-THE-SHOULDER | SILHOUETTE SHOT | DUTCH ANGLE |
+MEDIUM SHOT | TRACKING SHOT | POV SHOT | TWO-SHOT
+
+EXEMPLES DE BONS PROMPTS IMAGE :
+• "WIDE ESTABLISHING SHOT - the person from the reference photo standing before the Door of No Return in Ouidah Benin at sunset, fog rolling from the ocean, documentary photography, photorealistic, 8k, cinematic"
+• "EXTREME CLOSE-UP - the person from the reference photo's hands holding official citizenship documents, warm golden light, depth of field, photorealistic, 8k, cinematic"
+• "AERIAL VIEW - a coastal West African port town at dawn, crowded pier with hundreds of people arriving by boat, photorealistic, 8k, cinematic"
+
+═══════════════════════════════════════════
+FORMAT DE SORTIE — JSON STRICT
+═══════════════════════════════════════════
+Réponds UNIQUEMENT avec ce JSON, sans markdown, sans commentaires :
+{
+  "title": "Titre court et accrocheur (60 chars max)",
+  "description": "Résumé factuel et émouvant en 2 phrases",
+  "hashtags": ["#tag1","#tag2","#tag3","#tag4","#tag5"],
+  "segments": [
+    {
+      "index": 0,
+      "text": "Premier segment documentaire (30-45 mots). Accroche factuelle qui plante le contexte.",
+      "image_prompts": [
+        "TYPE DE PLAN - the person from the reference photo [action] in [lieu précis correspondant au texte], [lumière], photorealistic, 8k, cinematic",
+        "AUTRE TYPE DE PLAN - the person from the reference photo [action différente] in [autre décor lié au texte], [autre lumière], photorealistic, 8k, cinematic"
+      ]
+    }
+  ]
+}
+Les 10 segments doivent former un arc narratif complet : contexte → développement → tension → climax → resolution."""
+
 
 def _build_script_prompt(topic: str) -> str:
     return f"""{_NARRATIVE_SYSTEM}
 
-SUJET DU JOUR : "{topic}"
+SUJET : "{topic}"
 
-Génère maintenant un récit en 10 segments narratifs. JSON uniquement, sans markdown.
-
-Format exact (respecte strictement les clés) :
-{{"title":"Titre court et accrocheur (max 70 chars)","description":"Résumé émotionnel en 2 phrases","hashtags":["#tag1","#tag2","#tag3","#tag4","#tag5"],"segments":[{{"index":0,"text":"Première phrase narrative forte, accroche (20 mots max)","image_prompts":["WIDE ESTABLISHING SHOT - ..., photorealistic, 8k, cinematic","EXTREME CLOSE-UP - ..., photorealistic, 8k, cinematic"]}},{{"index":1,"text":"Deuxième beat narratif, développement (20 mots max)","image_prompts":["LOW ANGLE SHOT - ..., photorealistic, 8k, cinematic","AERIAL VIEW - ..., photorealistic, 8k, cinematic"]}},{{"index":2,"text":"...","image_prompts":["...","..."]}},{{"index":3,"text":"...","image_prompts":["...","..."]}},{{"index":4,"text":"...","image_prompts":["...","..."]}},{{"index":5,"text":"...","image_prompts":["...","..."]}},{{"index":6,"text":"...","image_prompts":["...","..."]}},{{"index":7,"text":"...","image_prompts":["...","..."]}},{{"index":8,"text":"...","image_prompts":["...","..."]}},{{"index":9,"text":"Dernière phrase, chute émotionnelle ou espoir (20 mots max)","image_prompts":["SILHOUETTE SHOT - ..., photorealistic, 8k, cinematic","CLOSE-UP PORTRAIT - ..., photorealistic, 8k, cinematic"]}}]}}
-
-Remplace TOUS les "..." par du contenu réel sur le sujet. JSON uniquement."""
+Génère maintenant les 10 segments documentaires sur ce sujet.
+Chaque "text" doit être entre 30 et 45 mots — assez long pour une narration audio fluide.
+Les image_prompts doivent correspondre exactement au lieu et au contexte décrit dans le texte.
+JSON uniquement, pas de markdown."""
 
 
 def _fallback_script(topic: str) -> dict:
+    t = topic[:60]
     return {
-        "title":       f"L'histoire de : {topic[:60]}",
-        "description": "Un récit humain et émouvant sur l'actualité du jour.",
-        "hashtags":    ["#histoire", "#récit", "#émotion", "#viral", "#info"],
+        "title":       f"Reportage : {t}",
+        "description": f"Un documentaire sur {t} et ses enjeux humains.",
+        "hashtags":    ["#reportage", "#documentaire", "#info", "#actualité", "#viral"],
         "segments": [
-            {"index": i, "text": f"Beat narratif {i+1} de l'histoire : {topic[:40]}",
-             "image_prompts": [
-                 f"WIDE ESTABLISHING SHOT - dramatic scene related to {topic[:35]}, golden hour, photorealistic, 8k, cinematic",
-                 f"CLOSE-UP PORTRAIT - emotional face related to {topic[:35]}, candlelight, photorealistic, 8k, cinematic",
-             ]}
+            {
+                "index": i,
+                "text":  f"Segment {i+1} — Au cœur de cette actualité mondiale, les faits révèlent une réalité complexe et profondément humaine qui touche des millions de personnes à travers le monde.",
+                "image_prompts": [
+                    f"WIDE ESTABLISHING SHOT - the person from the reference photo in a dramatic scene related to {t}, golden hour, photorealistic, 8k, cinematic",
+                    f"CLOSE-UP PORTRAIT - the person from the reference photo facing camera in context of {t}, dramatic lighting, photorealistic, 8k, cinematic",
+                ]
+            }
             for i in range(10)
         ],
     }
 
 
 def fetch_news_and_generate_script(custom_topic: str | None = None) -> dict:
-    """
-    If custom_topic is provided, skip news fetch and use it directly.
-    Otherwise fetch today's top news, then generate a 10-segment narrative script.
-    """
     session_id = str(uuid.uuid4())
 
-    # --- Step 1: Get topic ---
+    # Step 1: Get topic
     if custom_topic and custom_topic.strip():
         topic = custom_topic.strip()
         logger.info("Using custom topic: %s", topic)
     else:
         try:
             topic_raw = _call_text_api(
-                "Donne-moi l'actualité la plus importante et la plus émouvante d'aujourd'hui en une phrase courte, "
-                "en français. Réponds UNIQUEMENT avec la phrase, sans explication.",
+                "Donne-moi en une phrase courte (max 15 mots) le fait d'actualité le plus marquant "
+                "et le plus humain d'aujourd'hui, en français. Uniquement la phrase, sans ponctuation finale.",
                 timeout=30,
             )
-            topic = topic_raw.strip().strip('"').strip("'")
+            topic = topic_raw.strip().strip('"').strip("'").rstrip(".")
         except Exception as e:
-            logger.warning("News API failed: %s", e)
-            topic = "L'intelligence artificielle transforme le monde du travail"
+            logger.warning("News fetch failed: %s", e)
+            topic = "Le réchauffement climatique force des communautés entières à quitter leurs terres ancestrales"
 
-    # --- Step 2: Generate narrative script ---
-    try:
-        script_raw  = _call_text_api(_build_script_prompt(topic), timeout=90)
-        script_data = _extract_json(script_raw)
-    except Exception as e:
-        logger.warning("Script generation failed (%s), fallback", e)
-        script_data = _fallback_script(topic)
+    # Step 2: Generate narrative documentary script
+    for attempt in range(3):
+        try:
+            raw  = _call_text_api(_build_script_prompt(topic), timeout=120)
+            data = _extract_json(raw)
+            if data.get("segments") and len(data["segments"]) >= 5:
+                break
+        except Exception as e:
+            logger.warning("Script attempt %d failed: %s", attempt + 1, e)
+            data = {}
+    else:
+        data = _fallback_script(topic)
 
-    # Validate & pad segments to exactly 10
-    segments = script_data.get("segments", [])
+    # Validate & pad to exactly 10 segments
+    segments = data.get("segments", [])
     while len(segments) < 10:
         i = len(segments)
         segments.append({
             "index": i,
-            "text":  f"Un moment décisif dans cette histoire : {topic[:45]}",
+            "text":  f"Ce phénomène mondial, qui touche des millions de personnes, révèle les enjeux profonds d'une réalité que peu osent aborder : {topic[:50]}.",
             "image_prompts": [
-                f"DUTCH ANGLE SHOT - tense interior scene about {topic[:35]}, dramatic lighting, photorealistic, 8k, cinematic",
-                f"OVER-THE-SHOULDER - two people facing each other about {topic[:35]}, blue hour, photorealistic, 8k, cinematic",
+                f"MEDIUM SHOT - the person from the reference photo in a meaningful location related to {topic[:40]}, warm natural light, photorealistic, 8k, cinematic",
+                f"DUTCH ANGLE - the person from the reference photo in a dramatic context of {topic[:40]}, blue hour, photorealistic, 8k, cinematic",
             ],
         })
     segments = segments[:10]
@@ -275,7 +346,9 @@ def fetch_news_and_generate_script(custom_topic: str | None = None) -> dict:
         seg["index"] = i
         prompts = seg.get("image_prompts", [])
         while len(prompts) < 2:
-            prompts.append(f"WIDE SHOT - dramatic scene {i*2+len(prompts)} about {topic[:35]}, photorealistic, 8k, cinematic")
+            prompts.append(
+                f"WIDE SHOT - the person from the reference photo in a scene about {topic[:40]}, photorealistic, 8k, cinematic"
+            )
         seg["image_prompts"] = prompts[:2]
 
     import datetime
@@ -283,13 +356,13 @@ def fetch_news_and_generate_script(custom_topic: str | None = None) -> dict:
         "session_id":   session_id,
         "created_at":   datetime.datetime.utcnow().isoformat(),
         "topic":        topic,
-        "title":        script_data.get("title",       f"L'histoire : {topic}")[:80],
-        "description":  script_data.get("description", "Un récit sur l'actualité du jour.")[:200],
-        "hashtags":     script_data.get("hashtags",    ["#histoire", "#récit", "#viral", "#info", "#émotion"])[:5],
+        "title":        data.get("title",       f"Reportage : {topic}")[:80],
+        "description":  data.get("description", "Un documentaire sur l'actualité du monde.")[:200],
+        "hashtags":     data.get("hashtags",    ["#reportage", "#documentaire", "#info", "#actualité", "#viral"])[:5],
         "segments":     segments,
         "status":       "pending",
         "progress":     0,
-        "current_step": "Script généré. En attente de l'image du personnage.",
+        "current_step": "Script généré — en attente de l'image du personnage.",
         "images_done":  [],
         "audio_done":   [],
         "error":        None,
@@ -320,33 +393,46 @@ def generate_images(session_id: str, character_image_path: str,
         pct = 5 + int((i / 20) * 35)
 
         img_path = os.path.join(session_dir(session_id), f"image_{i:02d}.jpg")
-        try:
-            resp = requests.post(
-                IMAGE_EDIT_URL,
-                json={"prompt": prompt, "image": _encode_b64(prev_path)},
-                timeout=120,
-            )
-            resp.raise_for_status()
-            ct = resp.headers.get("content-type", "")
-            if "image" in ct:
-                raw = resp.content
-            else:
-                d   = resp.json()
-                b64 = d.get("image") or d.get("data") or d.get("result", "")
-                if b64.startswith("data:"):
-                    b64 = b64.split(",", 1)[1]
-                raw = base64.b64decode(b64)
-            with open(img_path, "wb") as f:
-                f.write(raw)
-            prev_path = img_path
-            logger.info("[%s] Image %d/20 OK", session_id, i + 1)
-        except Exception as e:
-            logger.error("[%s] Image %d failed: %s", session_id, i + 1, e)
+        success  = False
+
+        for attempt in range(3):
+            try:
+                resp = requests.post(
+                    IMAGE_EDIT_URL,
+                    json={"prompt": prompt, "image": _encode_b64(prev_path)},
+                    timeout=120,
+                )
+                resp.raise_for_status()
+                ct = resp.headers.get("content-type", "")
+                if "image" in ct:
+                    raw = resp.content
+                else:
+                    d   = resp.json()
+                    b64 = d.get("image") or d.get("data") or d.get("result", "")
+                    if isinstance(b64, str) and b64.startswith("data:"):
+                        b64 = b64.split(",", 1)[1]
+                    raw = base64.b64decode(b64)
+
+                if len(raw) < 5000:
+                    raise ValueError(f"Image too small ({len(raw)} bytes)")
+
+                with open(img_path, "wb") as f:
+                    f.write(raw)
+                prev_path = img_path
+                success   = True
+                logger.info("[%s] Image %d/20 OK (attempt %d)", session_id, i + 1, attempt + 1)
+                break
+            except Exception as e:
+                logger.warning("[%s] Image %d attempt %d failed: %s", session_id, i + 1, attempt + 1, e)
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+
+        if not success:
+            logger.error("[%s] Image %d: all attempts failed, copying previous", session_id, i + 1)
             shutil.copy(prev_path, img_path)
 
         image_paths.append(img_path)
 
-        # Update session with progress + which images are ready
         with _status_lock:
             data = load_session(session_id) or {}
             done = data.get("images_done", [])
@@ -355,14 +441,14 @@ def generate_images(session_id: str, character_image_path: str,
             data["images_done"]  = done
             data["status"]       = "generating"
             data["progress"]     = pct
-            data["current_step"] = f"Images {i+1}/20 • Audio {counters['aud']}/10 en parallèle..."
+            data["current_step"] = f"Images {i+1}/20 • Audio {counters.get('aud', 0)}/10 en parallèle..."
             save_session(session_id, data)
 
     return image_paths
 
 
 # ---------------------------------------------------------------------------
-# Phase 2b — Audio generation (parallel, with retry + proper WAV wrapping)
+# Phase 2b — Audio generation (parallel, validated, retry until real speech)
 # ---------------------------------------------------------------------------
 
 def _pcm_to_wav(pcm_data: bytes, sample_rate: int = 24000,
@@ -376,16 +462,57 @@ def _pcm_to_wav(pcm_data: bytes, sample_rate: int = 24000,
     return buf.getvalue()
 
 
-def _generate_gemini_tts(text: str, max_retries: int = 4) -> bytes:
-    """Call Gemini TTS with exponential-backoff retry. Returns proper WAV bytes."""
+def _wav_duration(path: str) -> float:
+    """Return duration in seconds, or 0 if file is invalid."""
+    try:
+        with wave.open(path, "r") as wf:
+            frames = wf.getnframes()
+            rate   = wf.getframerate()
+            if rate == 0:
+                return 0.0
+            return frames / rate
+    except Exception:
+        return 0.0
+
+
+def _wav_is_silent(path: str, threshold: float = 50.0) -> bool:
+    """Return True if the WAV file is essentially silent (RMS below threshold)."""
+    try:
+        with wave.open(path, "r") as wf:
+            frames = wf.readframes(wf.getnframes())
+            sw = wf.getsampwidth()
+        if sw == 2:
+            samples = array.array("h", frames)
+        else:
+            return False
+        if not samples:
+            return True
+        rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
+        return rms < threshold
+    except Exception:
+        return True
+
+
+def _generate_gemini_tts(text: str, max_retries: int = 5) -> bytes:
+    """
+    Call Gemini TTS with exponential-backoff retry.
+    Validates that the returned WAV contains real speech (not silence, not empty).
+    Returns valid WAV bytes.
+    """
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY not set")
+
+    clean_text = text.strip()
+    if not clean_text:
+        raise ValueError("Empty text passed to TTS")
+
+    logger.info("[TTS] Generating audio for: %s...", clean_text[:60])
 
     url = ("https://generativelanguage.googleapis.com/v1beta/models/"
            "gemini-2.5-flash-preview-tts:generateContent")
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
     payload = {
-        "contents": [{"parts": [{"text": text}]}],
+        "contents": [{"parts": [{"text": clean_text}]}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
             "speechConfig": {"voiceConfig": {
@@ -397,26 +524,62 @@ def _generate_gemini_tts(text: str, max_retries: int = 4) -> bytes:
     last_err = None
     for attempt in range(max_retries):
         try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=60)
+            resp = requests.post(url, headers=headers, json=payload, timeout=90)
             resp.raise_for_status()
-            data  = resp.json()
-            part  = data["candidates"][0]["content"]["parts"][0]["inlineData"]
-            raw   = base64.b64decode(part["data"])
+
+            data = resp.json()
+
+            # Navigate Gemini response structure
+            candidates = data.get("candidates", [])
+            if not candidates:
+                raise ValueError("No candidates in TTS response")
+
+            parts = candidates[0].get("content", {}).get("parts", [])
+            if not parts:
+                raise ValueError("No parts in TTS response")
+
+            inline = parts[0].get("inlineData", {})
+            b64    = inline.get("data", "")
+            if not b64:
+                raise ValueError("No audio data in TTS response")
+
+            raw = base64.b64decode(b64)
+            if len(raw) < 1000:
+                raise ValueError(f"Audio data too small ({len(raw)} bytes)")
+
             # Gemini TTS returns raw PCM — wrap in WAV if needed
             if raw[:4] != b"RIFF":
-                raw = _pcm_to_wav(raw, sample_rate=24000, channels=1, sample_width=2)
-            return raw
+                wav = _pcm_to_wav(raw, sample_rate=24000, channels=1, sample_width=2)
+            else:
+                wav = raw
+
+            # Validate duration
+            buf = io.BytesIO(wav)
+            try:
+                with wave.open(buf, "r") as wf:
+                    dur = wf.getnframes() / wf.getframerate()
+            except Exception as e:
+                raise ValueError(f"Invalid WAV: {e}")
+
+            if dur < 0.5:
+                raise ValueError(f"Audio too short: {dur:.2f}s")
+
+            logger.info("[TTS] OK (attempt %d) — duration %.2fs for: %s...",
+                        attempt + 1, dur, clean_text[:40])
+            return wav
+
         except Exception as e:
             last_err = e
-            wait = 2 ** attempt
-            logger.warning("[TTS] Attempt %d/%d failed (%s) — retrying in %ds",
+            wait = min(2 ** attempt, 30)
+            logger.warning("[TTS] Attempt %d/%d failed: %s — retry in %ds",
                            attempt + 1, max_retries, e, wait)
-            time.sleep(wait)
+            if attempt < max_retries - 1:
+                time.sleep(wait)
 
     raise RuntimeError(f"TTS failed after {max_retries} attempts: {last_err}")
 
 
-def _silent_wav(path: str, duration: float = 7.5, sample_rate: int = 24000):
+def _write_silent_wav(path: str, duration: float = 7.5, sample_rate: int = 24000):
     num_frames = int(sample_rate * duration)
     with wave.open(path, "w") as wf:
         wf.setnchannels(1)
@@ -425,31 +588,39 @@ def _silent_wav(path: str, duration: float = 7.5, sample_rate: int = 24000):
         wf.writeframes(array.array("h", [0] * num_frames).tobytes())
 
 
-def _wav_duration(path: str) -> float:
-    try:
-        with wave.open(path, "r") as wf:
-            return wf.getnframes() / wf.getframerate()
-    except Exception:
-        return 7.5
-
-
 def _generate_one_audio(session_id: str, i: int, seg: dict,
                         counters: dict, lock: threading.Lock) -> str:
     audio_path = os.path.join(session_dir(session_id), f"audio_{i:02d}.wav")
-    try:
-        wav_bytes = _generate_gemini_tts(seg["text"])
-        with open(audio_path, "wb") as f:
-            f.write(wav_bytes)
-        dur = _wav_duration(audio_path)
-        logger.info("[%s] Audio %d/10 OK (%.1fs)", session_id, i + 1, dur)
-    except Exception as e:
-        logger.error("[%s] Audio %d failed after retries: %s", session_id, i + 1, e)
-        _silent_wav(audio_path, duration=7.5)
+    text       = seg.get("text", "").strip()
+
+    if not text:
+        logger.error("[%s] Segment %d has empty text — writing silence", session_id, i)
+        _write_silent_wav(audio_path)
+    else:
+        try:
+            wav_bytes = _generate_gemini_tts(text)
+            with open(audio_path, "wb") as f:
+                f.write(wav_bytes)
+
+            dur = _wav_duration(audio_path)
+            logger.info("[%s] Audio %d/10 saved (%.2fs)", session_id, i + 1, dur)
+
+            # Extra safety: re-check silence
+            if _wav_is_silent(audio_path):
+                logger.warning("[%s] Audio %d sounds silent — retrying once", session_id, i)
+                wav_bytes2 = _generate_gemini_tts(text, max_retries=3)
+                with open(audio_path, "wb") as f:
+                    f.write(wav_bytes2)
+                dur = _wav_duration(audio_path)
+                logger.info("[%s] Audio %d re-generated (%.2fs)", session_id, i + 1, dur)
+
+        except Exception as e:
+            logger.error("[%s] Audio %d failed all retries: %s — writing silence", session_id, i + 1, e)
+            _write_silent_wav(audio_path)
 
     with lock:
-        counters["aud"] += 1
+        counters["aud"] = counters.get("aud", 0) + 1
 
-    # Update session with which audio files are ready
     with _status_lock:
         data = load_session(session_id) or {}
         done = data.get("audio_done", [])
@@ -465,6 +636,8 @@ def generate_audio(session_id: str, session_data: dict,
                    counters: dict, lock: threading.Lock) -> list[str]:
     segments    = session_data["segments"]
     audio_paths = [None] * len(segments)
+
+    # max_workers=2 avoids Gemini rate limits; segments run in parallel pairs
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = {
             executor.submit(_generate_one_audio, session_id, i, seg, counters, lock): i
@@ -473,6 +646,7 @@ def generate_audio(session_id: str, session_data: dict,
         for future in as_completed(futures):
             i              = futures[future]
             audio_paths[i] = future.result()
+
     return audio_paths
 
 
@@ -504,6 +678,7 @@ def _bake_subtitle_to_file(src_path: str, text: str, dst_path: str):
     draw = ImageDraw.Draw(img)
     font = _find_font(34)
 
+    # Word-wrap to max 2 lines
     words = text.split()
     mid   = max(1, len(words) // 2)
     lines = [" ".join(words[:mid])]
@@ -548,7 +723,7 @@ def assemble_video(session_id: str, image_paths: list[str],
                    audio_paths: list[str], session_data: dict) -> str:
     ff   = _ffmpeg()
     sdir = session_dir(session_id)
-    update_status(session_id, "assembling", 72, "Assemblage vidéo en cours...")
+    update_status(session_id, "assembling", 72, "Assemblage de la vidéo en cours...")
 
     segments      = session_data["segments"]
     segment_clips = []
@@ -563,9 +738,23 @@ def assemble_video(session_id: str, image_paths: list[str],
         audio_path = audio_paths[seg_i] if seg_i < len(audio_paths) else None
         if not audio_path or not os.path.exists(audio_path):
             audio_path = os.path.join(sdir, f"audio_{seg_i:02d}.wav")
-            _silent_wav(audio_path)
-        audio_dur  = _wav_duration(audio_path)
-        img_dur    = max(audio_dur / 2.0, 1.0)
+            _write_silent_wav(audio_path)
+
+        audio_dur = _wav_duration(audio_path)
+        if audio_dur < 0.5:
+            logger.warning("[%s] Segment %d audio too short (%.2fs) — re-generating",
+                           session_id, seg_i, audio_dur)
+            try:
+                wav = _generate_gemini_tts(seg["text"], max_retries=3)
+                with open(audio_path, "wb") as f:
+                    f.write(wav)
+                audio_dur = _wav_duration(audio_path)
+            except Exception as e:
+                logger.error("[%s] Re-gen failed: %s", session_id, e)
+                _write_silent_wav(audio_path, duration=7.0)
+                audio_dur = 7.0
+
+        img_dur = max(audio_dur / 2.0, 1.0)
 
         baked = []
         for offset in range(2):
@@ -584,7 +773,6 @@ def assemble_video(session_id: str, image_paths: list[str],
             f"[1:v]{vf1}[v1];"
             f"[v0][v1]concat=n=2:v=1:a=0[vout]"
         )
-
         cmd = [
             ff, "-y",
             "-loop", "1", "-t", f"{img_dur:.4f}", "-i", baked[0],
@@ -600,7 +788,7 @@ def assemble_video(session_id: str, image_paths: list[str],
         ]
         try:
             _run_ff(cmd, timeout=180)
-            logger.info("[%s] Segment %d/10 assembled", session_id, seg_i + 1)
+            logger.info("[%s] Segment %d/10 assembled (audio %.2fs)", session_id, seg_i + 1, audio_dur)
         except Exception as e:
             logger.error("[%s] Segment %d assembly failed: %s", session_id, seg_i + 1, e)
             raise
@@ -621,7 +809,8 @@ def assemble_video(session_id: str, image_paths: list[str],
         "-c:a", "aac", "-b:a", "128k",
         out_path,
     ], timeout=300)
-    logger.info("[%s] Final video: %s", session_id, out_path)
+
+    logger.info("[%s] Final video ready: %s", session_id, out_path)
     return out_path
 
 
@@ -692,7 +881,7 @@ def run_production(session_id: str, character_image_path: str):
             data["error"]            = None
             save_session(session_id, data)
 
-        logger.info("[%s] Production complete → %s", session_id, video_path)
+        logger.info("[%s] Production complete", session_id)
 
     except Exception as e:
         logger.error("[%s] Production failed: %s", session_id, e, exc_info=True)

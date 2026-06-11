@@ -1,0 +1,6 @@
+- [Vite build PORT guard](vite-build-port-guard.md) — vite.config.ts must not throw if PORT is absent during `vite build`; guard with `isBuild = process.argv.includes("build")`.
+- [Gemini TTS PCM format](gemini-tts-pcm.md) — TTS returns raw PCM (not WAV); always wrap with _pcm_to_wav(); validate duration > 0.5s + RMS silence check after saving.
+- [React Query Orval hook options](react-query-orval-options.md) — Orval-generated hooks take `{ query: { queryKey, enabled, ... } }` wrapper; queryKey is required and must come from the generated getXxxQueryKey() helper.
+- [Assembly no MoviePy](assembly-ffmpeg-only.md) — MoviePy 2.x is unreliable for this stack; all assembly via ffmpeg subprocess with filter_complex concat; Ken Burns = scale 110% + slow crop.
+- [Sessions dir production fallback](sessions-dir-prod.md) — SESSIONS_DIR uses write-test fallback to /tmp/v_ctrl_sessions/ when default workspace path is not writable in production.
+- [Narrative documentary style](narrative-style.md) — Script prompts must produce Al Jazeera/Vice News style: events/facts/quotes, NOT character movement or sensation descriptions. Image prompts must include "the person from the reference photo" + exact location matching narration.
