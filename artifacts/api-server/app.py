@@ -12,6 +12,8 @@ from pipeline import (
     session_dir, find_character_image,
     auto_resume_stalled_sessions,
     create_bundle_zip,
+    repair_audio_files,
+    audio_file_has_speech,
     SESSIONS_DIR,
 )
 
@@ -222,6 +224,96 @@ def download_bundle(session_id: str):
         return jsonify({"error": str(e)}), 500
     return send_file(zip_path, mimetype="application/zip", as_attachment=True,
                      download_name=f"bundle_{session_id[:8]}.zip")
+
+
+# ---------------------------------------------------------------------------
+# Audio scan & repair
+# ---------------------------------------------------------------------------
+
+@app.route("/api/audio-scan/<session_id>")
+def audio_scan(session_id: str):
+    """
+    Scan all 10 audio files and report which ones contain real speech.
+    Returns per-file results without modifying anything.
+    """
+    data = load_session(session_id)
+    if not data: abort(404)
+    sdir    = session_dir(session_id)
+    results = []
+    for i in range(10):
+        ap = os.path.join(sdir, f"audio_{i:02d}.wav")
+        if not os.path.exists(ap):
+            results.append({"index": i, "status": "missing"})
+            continue
+        size = os.path.getsize(ap)
+        ok, reason = audio_file_has_speech(ap)
+        results.append({
+            "index":  i,
+            "status": "ok" if ok else "no_speech",
+            "reason": reason,
+            "size":   size,
+        })
+    bad = [r["index"] for r in results if r["status"] != "ok"]
+    return jsonify({"session_id": session_id, "results": results, "bad_indices": bad}), 200
+
+
+@app.route("/api/repair-audio/<session_id>", methods=["POST"])
+def repair_audio(session_id: str):
+    """
+    Scan all audio files; regenerate any that have no speech.
+    Runs synchronously (blocks until done). Returns which files were repaired.
+    After repair you should re-assemble: call /api/reassemble/<session_id>.
+    """
+    data = load_session(session_id)
+    if not data: abort(404)
+
+    logger.info("Audio repair requested for session %s", session_id)
+    result = repair_audio_files(session_id)
+    return jsonify({"session_id": session_id, **result}), 200
+
+
+@app.route("/api/reassemble/<session_id>", methods=["POST"])
+def reassemble(session_id: str):
+    """
+    Re-run only the assembly phase (Phase 3) for a completed or errored session.
+    Useful after /api/repair-audio to rebuild the video with fixed audio.
+    """
+    data = load_session(session_id)
+    if not data: abort(404)
+
+    sdir = session_dir(session_id)
+
+    # Build image / audio path lists from disk
+    from pipeline import assemble_video, TOTAL_IMGS, _wav_duration
+    image_paths = []
+    for i in range(TOTAL_IMGS):
+        p = os.path.join(sdir, f"image_{i:02d}.jpg")
+        image_paths.append(p if os.path.exists(p) else None)
+
+    audio_paths = []
+    for i in range(10):
+        p = os.path.join(sdir, f"audio_{i:02d}.wav")
+        audio_paths.append(p if os.path.exists(p) else None)
+
+    def _do_reassemble():
+        try:
+            video_path = assemble_video(session_id, image_paths, audio_paths, data)
+            d = load_session(session_id) or data
+            d.update({
+                "status": "done", "progress": 100,
+                "current_step": "Vidéo ré-assemblée !",
+                "video_path": video_path,
+                "video_url": f"/api/download/{session_id}",
+                "error": None,
+            })
+            save_session(session_id, d)
+            logger.info("[%s] Re-assembly complete", session_id)
+        except Exception as e:
+            logger.error("[%s] Re-assembly failed: %s", session_id, e, exc_info=True)
+            update_status(session_id, "error", 0, "Échec du ré-assemblage.", str(e))
+
+    threading.Thread(target=_do_reassemble, daemon=True).start()
+    return jsonify({"session_id": session_id, "status": "reassembling"}), 202
 
 
 # ---------------------------------------------------------------------------

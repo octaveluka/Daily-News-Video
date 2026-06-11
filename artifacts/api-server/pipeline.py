@@ -539,11 +539,85 @@ def _write_silent_wav(path: str, duration: float = 7.5, rate: int = 24000):
         wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(rate)
         wf.writeframes(array.array("h", [0] * n).tobytes())
 
-MIN_AUDIO_DURATION = 2.0    # seconds — below this we retry
-MIN_AUDIO_RMS      = 50.0   # RMS threshold for silence detection
+MIN_AUDIO_DURATION   = 2.0    # seconds — below this we retry
+MIN_AUDIO_RMS        = 50.0   # overall RMS threshold
+SPEECH_CHUNK_MS      = 400    # ms per energy window for speech detection
+SPEECH_MIN_LOUD_FRAC = 0.25   # at least 25 % of chunks must be "loud"
+SPEECH_MIN_LOUD_RMS  = 200    # chunk RMS considered "loud"
+SPEECH_MIN_VARIANCE  = 1500   # variance of chunk-RMS must be above this
+
+
+def _has_speech(wav_bytes: bytes) -> tuple[bool, str]:
+    """
+    Detect whether a WAV file contains actual speech (not silence/noise).
+
+    Strategy: split into 400 ms windows, compute RMS per window.
+      • Real speech  → energy varies over time (high variance) AND
+                        several windows are "loud" (RMS > 200)
+      • Silence/noise → all windows at similar (low) energy (low variance)
+
+    Returns (ok: bool, reason: str)
+    """
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "r") as wf:
+            rate  = wf.getframerate()
+            sw    = wf.getsampwidth()
+            nch   = wf.getnchannels()
+            frames = wf.readframes(wf.getnframes())
+    except Exception as e:
+        return False, f"WAV parse error: {e}"
+
+    if sw != 2:
+        # Non-16-bit — can't validate reliably, assume OK
+        return True, "non-16bit, skip"
+
+    # Collapse to mono if stereo
+    if nch == 2:
+        all_s = array.array("h", frames)
+        mono  = array.array("h", [int((all_s[i] + all_s[i+1]) / 2) for i in range(0, len(all_s)-1, 2)])
+        frames = mono.tobytes()
+
+    samples_per_chunk = int(rate * SPEECH_CHUNK_MS / 1000)
+    all_samples = array.array("h", frames)
+    total = len(all_samples)
+    if total == 0:
+        return False, "empty audio"
+
+    chunk_rms_vals = []
+    for start in range(0, total, samples_per_chunk):
+        chunk = all_samples[start:start + samples_per_chunk]
+        if len(chunk) < samples_per_chunk // 4:
+            break
+        rms = (sum(s * s for s in chunk) / len(chunk)) ** 0.5
+        chunk_rms_vals.append(rms)
+
+    if not chunk_rms_vals:
+        return False, "no chunks"
+
+    n = len(chunk_rms_vals)
+    mean_rms  = sum(chunk_rms_vals) / n
+    variance  = sum((r - mean_rms) ** 2 for r in chunk_rms_vals) / n
+    loud_frac = sum(1 for r in chunk_rms_vals if r > SPEECH_MIN_LOUD_RMS) / n
+
+    ok = variance >= SPEECH_MIN_VARIANCE and loud_frac >= SPEECH_MIN_LOUD_FRAC
+    reason = (f"variance={variance:.0f} loud_frac={loud_frac:.2f} "
+              f"mean_rms={mean_rms:.0f} chunks={n}")
+    logger.debug("[speech-check] %s → %s", "OK" if ok else "NO-SPEECH", reason)
+    return ok, reason
+
+
+def audio_file_has_speech(path: str) -> tuple[bool, str]:
+    """Wrapper: read file from disk then run _has_speech."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        return _has_speech(data)
+    except Exception as e:
+        return False, f"read error: {e}"
+
 
 def _generate_gemini_tts(text: str, max_retries: int = 5) -> bytes:
-    """Generate audio via Gemini TTS. Validates duration ≥ 2 s and non-silence."""
+    """Generate audio via Gemini TTS. Validates duration, RMS, and speech presence."""
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY not set")
     clean = text.strip()
@@ -575,22 +649,29 @@ def _generate_gemini_tts(text: str, max_retries: int = 5) -> bytes:
                 raise ValueError(f"Audio payload too small ({len(raw)} B)")
             wav = raw if raw[:4] == b"RIFF" else _pcm_to_wav(raw)
 
-            # --- Strict validation ---
+            # 1 — Duration check
             dur = _wav_duration(wav)
             if dur < MIN_AUDIO_DURATION:
                 raise ValueError(f"Audio too short: {dur:.2f}s < {MIN_AUDIO_DURATION}s")
+
+            # 2 — Global RMS (catches total silence)
             rms = _wav_rms(wav)
             if rms < MIN_AUDIO_RMS:
-                raise ValueError(f"Audio is silent (RMS={rms:.1f} < {MIN_AUDIO_RMS})")
+                raise ValueError(f"Audio is silent (RMS={rms:.1f})")
 
-            logger.info("[TTS] OK attempt=%d dur=%.2fs rms=%.0f text=%.40s",
+            # 3 — Speech presence: variance of energy over time windows
+            ok, reason = _has_speech(wav)
+            if not ok:
+                raise ValueError(f"No speech detected ({reason})")
+
+            logger.info("[TTS] ✓ attempt=%d dur=%.2fs rms=%.0f text=%.40s",
                         attempt + 1, dur, rms, clean)
             return wav
 
         except Exception as e:
             last_err = e
-            wait = min(2 ** attempt, 30)
-            logger.warning("[TTS] attempt %d/%d failed: %s — retry in %ds",
+            wait = min(2 ** attempt, 20)
+            logger.warning("[TTS] attempt %d/%d — %s — retry in %ds",
                            attempt + 1, max_retries, e, wait)
             if attempt < max_retries - 1:
                 time.sleep(wait)
@@ -642,13 +723,78 @@ def generate_audio(session_id: str, session_data: dict,
                    counters: dict, lock: threading.Lock) -> list[str]:
     segments    = session_data["segments"]
     audio_paths = [None] * len(segments)
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(_generate_one_audio, session_id, i, seg, counters, lock): i
                    for i, seg in enumerate(segments)}
         for future in as_completed(futures):
             i = futures[future]
             audio_paths[i] = future.result()
     return audio_paths
+
+
+# ---------------------------------------------------------------------------
+# Audio repair — scan all audio files and regenerate any without real speech
+# ---------------------------------------------------------------------------
+
+def repair_audio_files(session_id: str) -> dict:
+    """
+    Scan all 10 audio files for a session. Any file that fails the speech
+    check is regenerated via Gemini TTS.
+    Returns {"repaired": [indices], "ok": [indices], "failed": [indices]}
+    """
+    session_data = load_session(session_id)
+    if not session_data:
+        return {"error": "session not found"}
+
+    segments = session_data.get("segments", [])
+    sdir     = session_dir(session_id)
+
+    bad_indices = []
+    ok_indices  = []
+
+    for i in range(10):
+        ap = os.path.join(sdir, f"audio_{i:02d}.wav")
+        if not os.path.exists(ap):
+            bad_indices.append(i)
+            continue
+        ok, reason = audio_file_has_speech(ap)
+        if ok:
+            ok_indices.append(i)
+        else:
+            logger.warning("[%s] Audio %02d needs repair: %s", session_id, i, reason)
+            bad_indices.append(i)
+
+    if not bad_indices:
+        logger.info("[%s] Audio repair: all %d files OK", session_id, len(ok_indices))
+        return {"repaired": [], "ok": ok_indices, "failed": []}
+
+    logger.info("[%s] Audio repair: %d bad files to regenerate: %s",
+                session_id, len(bad_indices), bad_indices)
+
+    repaired = []
+    failed   = []
+
+    def _repair_one(i: int):
+        ap   = os.path.join(sdir, f"audio_{i:02d}.wav")
+        text = segments[i]["text"].strip() if i < len(segments) else ""
+        if not text:
+            _write_silent_wav(ap, 7.5)
+            failed.append(i)
+            return
+        try:
+            wav = _generate_gemini_tts(text, max_retries=7)
+            with open(ap, "wb") as f:
+                f.write(wav)
+            repaired.append(i)
+            logger.info("[%s] Audio %02d repaired OK", session_id, i)
+        except Exception as e:
+            logger.error("[%s] Audio %02d repair failed: %s", session_id, i, e)
+            failed.append(i)
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        list(pool.map(_repair_one, bad_indices))
+
+    return {"repaired": sorted(repaired), "ok": sorted(ok_indices), "failed": sorted(failed)}
 
 
 # ---------------------------------------------------------------------------
@@ -704,46 +850,84 @@ def assemble_video(session_id: str, image_paths: list[str],
       - image0 = image_paths[si*2]     → dur/2 seconds
       - image1 = image_paths[si*2+1]   → dur/2 seconds
     Total: 10 × (2 images) = 20 images, exactly matching the 10 audio tracks.
+
+    Audio is trimmed inside filter_complex via atrim to guarantee sync.
     """
     video_format = session_data.get("video_format", "16:9")
     vw, vh = _dims(video_format)
 
-    ff   = _ffmpeg()
-    sdir = session_dir(session_id)
-    update_status(session_id, "assembling", 72, "Assemblage de la vidéo en cours...")
+    ff      = _ffmpeg()
+    sdir    = session_dir(session_id)
     segments = session_data["segments"]
-    clips    = []
+
+    # ── Pre-assembly pass: scan every audio file, regenerate bad ones ──────
+    update_status(session_id, "assembling", 70,
+                  "Vérification des fichiers audio avant montage…")
+    bad = []
+    for si in range(10):
+        ap = (audio_paths[si]
+              if si < len(audio_paths) and audio_paths[si]
+              else os.path.join(sdir, f"audio_{si:02d}.wav"))
+        if not os.path.exists(ap):
+            bad.append(si); continue
+        ok, reason = audio_file_has_speech(ap)
+        if not ok:
+            logger.warning("[%s] Pre-assembly: audio %02d has no speech (%s) — queued for regen",
+                           session_id, si, reason)
+            bad.append(si)
+
+    if bad:
+        logger.info("[%s] Pre-assembly regen for %d audio files: %s", session_id, len(bad), bad)
+        update_status(session_id, "assembling", 71,
+                      f"Regénération de {len(bad)} audio(s) sans parole…")
+
+        def _regen(si: int):
+            ap   = os.path.join(sdir, f"audio_{si:02d}.wav")
+            text = segments[si]["text"].strip() if si < len(segments) else ""
+            if not text:
+                return
+            try:
+                wav = _generate_gemini_tts(text, max_retries=7)
+                with open(ap, "wb") as f:
+                    f.write(wav)
+                if si < len(audio_paths):
+                    audio_paths[si] = ap
+                logger.info("[%s] Pre-assembly regen %02d OK", session_id, si)
+            except Exception as e:
+                logger.error("[%s] Pre-assembly regen %02d failed: %s", session_id, si, e)
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            list(pool.map(_regen, bad))
+
+    update_status(session_id, "assembling", 72, "Montage des segments vidéo…")
+    clips = []
 
     for si in range(10):
         update_status(session_id, "assembling", 72 + int((si / 10) * 24),
-                      f"Rendu segment {si+1}/10...", last_heartbeat=time.time())
+                      f"Rendu segment {si+1}/10…", last_heartbeat=time.time())
 
-        # ── Audio ──
-        ap = audio_paths[si] if si < len(audio_paths) else None
-        if not ap or not os.path.exists(ap):
+        # ── Resolve audio path ──
+        ap = (audio_paths[si]
+              if si < len(audio_paths) and audio_paths[si]
+              else os.path.join(sdir, f"audio_{si:02d}.wav"))
+        if not os.path.exists(ap):
             ap = os.path.join(sdir, f"audio_{si:02d}.wav")
-            _write_silent_wav(ap)
+            _write_silent_wav(ap, 7.5)
 
         dur = _wav_duration(ap)
         if dur < MIN_AUDIO_DURATION:
-            # One last regen attempt before using silence
-            try:
-                wav = _generate_gemini_tts(segments[si]["text"], max_retries=5)
-                with open(ap, "wb") as f: f.write(wav)
-                dur = _wav_duration(ap)
-            except Exception as err:
-                logger.error("[%s] Segment %d audio re-gen failed: %s", session_id, si, err)
-            if dur < 0.1:
-                _write_silent_wav(ap, 7.5)
-                dur = 7.5
+            logger.warning("[%s] Segment %d: audio still too short (%.2fs) — silent fallback",
+                           session_id, si, dur)
+            _write_silent_wav(ap, 7.5)
+            dur = 7.5
 
         # ── Each image gets exactly half the audio duration ──
         img_dur = dur / 2.0
 
-        # ── Prepare the 2 images for this segment ──
+        # ── Prepare the 2 images ──
         baked = []
         for off in range(2):
-            idx = si * 2 + off                          # 0→(0,1), 1→(2,3), …, 9→(18,19)
+            idx = si * 2 + off
             idx = max(0, min(idx, TOTAL_IMGS - 1))
             src = (image_paths[idx]
                    if idx < len(image_paths) and image_paths[idx]
@@ -758,22 +942,30 @@ def assemble_video(session_id: str, image_paths: list[str],
         vf1 = _kb_vf(vw, vh, img_dur, "rev" if d == "fwd" else "fwd")
 
         clip = os.path.join(sdir, f"seg_{si:02d}.mp4")
-        filt = f"[0:v]{vf0}[v0];[1:v]{vf1}[v1];[v0][v1]concat=n=2:v=1:a=0[vout]"
+
+        # Audio is trimmed INSIDE filter_complex (atrim) — avoids the ffmpeg
+        # quirk where output-level -t can silently drop the audio stream when
+        # combined with -filter_complex + -map.
+        filt = (
+            f"[0:v]{vf0}[v0];"
+            f"[1:v]{vf1}[v1];"
+            f"[v0][v1]concat=n=2:v=1:a=0[vout];"
+            f"[2:a]atrim=0:{dur:.4f},asetpts=PTS-STARTPTS[aout]"
+        )
 
         _run_ff([ff, "-y",
             "-loop", "1", "-t", f"{img_dur:.4f}", "-i", baked[0],
             "-loop", "1", "-t", f"{img_dur:.4f}", "-i", baked[1],
             "-i", ap,
             "-filter_complex", filt,
-            "-map", "[vout]", "-map", "2:a",
-            "-t", f"{dur:.4f}",
+            "-map", "[vout]", "-map", "[aout]",
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
             "-pix_fmt", "yuv420p", "-r", str(FPS),
             "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "1",
             clip
         ], timeout=180)
         clips.append(clip)
-        logger.info("[%s] Segment %d/10 assembled — audio=%.2fs img_dur=%.2fs",
+        logger.info("[%s] Segment %d/10 OK — audio=%.2fs each_img=%.2fs",
                     session_id, si + 1, dur, img_dur)
 
     concat_txt = os.path.join(sdir, "concat.txt")
