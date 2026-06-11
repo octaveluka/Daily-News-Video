@@ -2,11 +2,16 @@
 V-CTRL — Video generation pipeline
   Phase 1 : fetch news / custom topic → 10-segment DOCUMENTARY script + 20 image prompts
   Phase 2 : three parallel threads start simultaneously:
-              • Thread A (External API) : images 0-12, sequential + chained
-              • Thread B (Gemini Flash) : images 13-19, parallel image generation
-              • Thread C (Gemini TTS)  : audio 0-9, parallel
+              • Thread A (External API) : 20 images — 4 sections of 5 in parallel
+              • Thread B (Gemini TTS)  : audio 0-9, parallel
   Phase 3 : pure ffmpeg assembly — Ken Burns + subtitle baking via PIL
 
+Image generation rules:
+  - ALL 20 images use the ORIGINAL character image as reference (never chained)
+  - 4 parallel sections of 5 images each (max_workers=5 concurrent requests)
+  - 1 audio segment covers exactly 2 images (no overflow)
+
+Session persistence: PostgreSQL (Replit database)
 Auto-resume: on startup, any session with status "generating"/"assembling"/"pending"
 that has a saved character_image_path and a stale heartbeat gets restarted automatically.
 """
@@ -16,7 +21,8 @@ import logging, subprocess, threading, time, re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
-import numpy as np
+import psycopg2
+import psycopg2.extras
 from PIL import Image as PILImage, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
@@ -45,13 +51,23 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 VIDEO_W, VIDEO_H = 1280, 720
 FPS = 24
 
-# Images 0-12  → External chained API (first 13)
-EXTERNAL_IMG_COUNT = 13
-# Images 13-19 → Gemini Flash image generation (last 7)
-GEMINI_IMG_COUNT   = 7
-TOTAL_IMGS         = EXTERNAL_IMG_COUNT + GEMINI_IMG_COUNT   # 20
+TOTAL_IMGS  = 20   # all via external API
+SECTION_SIZE = 5   # images per parallel section  (20 / 4 sections)
+N_SECTIONS   = 4   # sections running in parallel
 
 _status_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL helpers
+# ---------------------------------------------------------------------------
+
+def _get_db_conn():
+    """Return a new psycopg2 connection using DATABASE_URL."""
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        raise RuntimeError("DATABASE_URL environment variable not set")
+    return psycopg2.connect(db_url)
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +89,7 @@ def _run_ff(args: list, timeout: int = 180):
 
 
 # ---------------------------------------------------------------------------
-# Session helpers
+# Session helpers — PostgreSQL backed
 # ---------------------------------------------------------------------------
 
 def session_dir(session_id: str) -> str:
@@ -81,52 +97,104 @@ def session_dir(session_id: str) -> str:
     os.makedirs(p, exist_ok=True)
     return p
 
+
 def load_session(session_id: str) -> dict | None:
-    p = os.path.join(SESSIONS_DIR, session_id, "data.json")
-    if not os.path.exists(p):
-        return None
     try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+        conn = _get_db_conn()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT data FROM sessions WHERE session_id = %s", (session_id,))
+                row = cur.fetchone()
+                return dict(row["data"]) if row else None
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error("[DB] load_session %s: %s", session_id, e)
         return None
+
 
 def save_session(session_id: str, data: dict):
-    p = os.path.join(SESSIONS_DIR, session_id, "data.json")
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    try:
+        conn = _get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO sessions (session_id, topic, title, status, progress,
+                                         current_step, error, video_path, created_at,
+                                         last_heartbeat, data)
+                    VALUES (%(sid)s, %(topic)s, %(title)s, %(status)s, %(progress)s,
+                            %(step)s, %(error)s, %(vpath)s,
+                            COALESCE(%(cat)s::timestamptz, NOW()),
+                            %(hb)s, %(data)s)
+                    ON CONFLICT (session_id) DO UPDATE SET
+                        topic          = EXCLUDED.topic,
+                        title          = EXCLUDED.title,
+                        status         = EXCLUDED.status,
+                        progress       = EXCLUDED.progress,
+                        current_step   = EXCLUDED.current_step,
+                        error          = EXCLUDED.error,
+                        video_path     = EXCLUDED.video_path,
+                        last_heartbeat = EXCLUDED.last_heartbeat,
+                        data           = EXCLUDED.data
+                """, {
+                    "sid":     session_id,
+                    "topic":   data.get("topic", ""),
+                    "title":   data.get("title", ""),
+                    "status":  data.get("status", "pending"),
+                    "progress": data.get("progress", 0),
+                    "step":    data.get("current_step", ""),
+                    "error":   data.get("error"),
+                    "vpath":   data.get("video_path"),
+                    "cat":     data.get("created_at"),
+                    "hb":      data.get("last_heartbeat", 0),
+                    "data":    json.dumps(data, ensure_ascii=False),
+                })
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error("[DB] save_session %s: %s", session_id, e)
+
 
 def list_sessions() -> list[dict]:
-    sessions = []
-    if not os.path.isdir(SESSIONS_DIR):
-        return sessions
-    for sid in os.listdir(SESSIONS_DIR):
-        d = load_session(sid)
-        if d:
-            sessions.append({
-                "session_id":   sid,
-                "topic":        d.get("topic", ""),
-                "title":        d.get("title", ""),
-                "status":       d.get("status", "unknown"),
-                "progress":     d.get("progress", 0),
-                "current_step": d.get("current_step", ""),
-                "error":        d.get("error"),
-                "video_url":    f"/api/download/{sid}" if d.get("status") == "done" else None,
-                "created_at":   d.get("created_at", ""),
-            })
-    sessions.sort(key=lambda s: s.get("created_at", ""), reverse=True)
-    return sessions
+    try:
+        conn = _get_db_conn()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT session_id, topic, title, status, progress,
+                           current_step, error, video_path, created_at
+                    FROM sessions
+                    ORDER BY created_at DESC
+                """)
+                rows = cur.fetchall()
+                return [{
+                    "session_id":   r["session_id"],
+                    "topic":        r["topic"],
+                    "title":        r["title"],
+                    "status":       r["status"],
+                    "progress":     r["progress"],
+                    "current_step": r["current_step"],
+                    "error":        r["error"],
+                    "video_url":    f"/api/download/{r['session_id']}" if r["status"] == "done" else None,
+                    "created_at":   r["created_at"].isoformat() if r["created_at"] else "",
+                } for r in rows]
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error("[DB] list_sessions: %s", e)
+        return []
+
 
 def update_status(session_id: str, status: str, progress: int,
                   current_step: str, error: str | None = None, **extra):
     with _status_lock:
         data = load_session(session_id) or {}
-        data["status"]          = status
-        data["progress"]        = progress
-        data["current_step"]    = current_step
-        data["error"]           = error
-        data["last_heartbeat"]  = time.time()   # always refresh heartbeat
+        data["status"]         = status
+        data["progress"]       = progress
+        data["current_step"]   = current_step
+        data["error"]          = error
+        data["last_heartbeat"] = time.time()
         data.update(extra)
         save_session(session_id, data)
 
@@ -138,35 +206,43 @@ def update_status(session_id: str, status: str, progress: int,
 def auto_resume_stalled_sessions():
     """
     Called once on Flask startup.
-    Any session that was left in 'generating'/'assembling'/'pending' state
-    with a saved character image and a heartbeat older than 5 minutes is restarted.
+    Any session left in 'generating'/'assembling'/'pending' state with a saved
+    character image and a heartbeat older than 5 minutes is restarted.
     """
-    if not os.path.isdir(SESSIONS_DIR):
-        return
-    now = time.time()
-    for sid in os.listdir(SESSIONS_DIR):
+    try:
+        conn = _get_db_conn()
         try:
-            data = load_session(sid)
-            if not data:
-                continue
-            status = data.get("status")
-            if status not in ("generating", "assembling", "pending"):
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT session_id, data FROM sessions
+                    WHERE status IN ('generating', 'assembling', 'pending')
+                """)
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("[auto-resume] DB error: %s", e)
+        return
+
+    now = time.time()
+    for row in rows:
+        try:
+            sid  = row["session_id"]
+            data = dict(row["data"]) if row["data"] else {}
+            hb   = data.get("last_heartbeat", 0)
+            if now - hb < 300:
                 continue
             char_img = data.get("character_image_path")
             if not char_img or not os.path.exists(char_img):
                 continue
-            hb = data.get("last_heartbeat", 0)
-            if now - hb < 300:                  # still has a live heartbeat
-                continue
-            logger.info("[auto-resume] Restarting stalled session %s (status=%s)", sid, status)
+            logger.info("[auto-resume] Restarting stalled session %s", sid)
             t = threading.Thread(target=run_production, args=(sid, char_img), daemon=True)
             t.start()
         except Exception as e:
-            logger.warning("[auto-resume] Error checking session %s: %s", sid, e)
+            logger.warning("[auto-resume] Error checking session %s: %s", row.get("session_id"), e)
 
 
 def find_character_image(session_id: str) -> str | None:
-    """Return the character image path saved in session data, or None."""
     data = load_session(session_id)
     if not data:
         return None
@@ -321,155 +397,111 @@ def _encode_b64(path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2a-A — External API: images 0 to EXTERNAL_IMG_COUNT-1 (sequential, chained)
+# Phase 2a — External API: ALL 20 images
+# 4 parallel sections of 5 images each.
+# IMPORTANT: each image uses the ORIGINAL character image as reference (no chaining).
 # ---------------------------------------------------------------------------
 
-def generate_images_external(session_id: str, character_image_path: str,
-                              all_prompts: list[str], counters: dict,
-                              lock: threading.Lock, image_paths: list) -> None:
-    """Generates images 0..12 using the chained external API."""
-    prev_path = character_image_path
+def _generate_one_image(session_id: str, i: int, prompt: str,
+                         character_image_path: str,
+                         counters: dict, lock: threading.Lock,
+                         image_paths: list) -> None:
+    """Generate a single image via the external edit API using the original character image."""
+    img_path = os.path.join(session_dir(session_id), f"image_{i:02d}.jpg")
+    success  = False
 
-    for i in range(EXTERNAL_IMG_COUNT):
-        prompt   = all_prompts[i]
-        img_path = os.path.join(session_dir(session_id), f"image_{i:02d}.jpg")
-        success  = False
-
-        for attempt in range(3):
-            try:
-                resp = requests.post(IMAGE_EDIT_URL,
-                    json={"prompt": prompt, "image": _encode_b64(prev_path)},
-                    timeout=120)
-                resp.raise_for_status()
-                ct = resp.headers.get("content-type", "")
-                if "image" in ct:
-                    raw = resp.content
-                else:
-                    d   = resp.json()
-                    b64 = d.get("image") or d.get("data") or d.get("result", "")
-                    if isinstance(b64, str) and b64.startswith("data:"):
-                        b64 = b64.split(",", 1)[1]
-                    raw = base64.b64decode(b64)
-                if len(raw) < 5000:
-                    raise ValueError(f"Image too small ({len(raw)} bytes)")
-                with open(img_path, "wb") as f:
-                    f.write(raw)
-                prev_path = img_path
-                success   = True
-                logger.info("[%s] Ext-image %d/13 OK (attempt %d)", session_id, i + 1, attempt + 1)
-                break
-            except Exception as e:
-                logger.warning("[%s] Ext-image %d attempt %d: %s", session_id, i + 1, attempt + 1, e)
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
-
-        if not success:
-            logger.error("[%s] Ext-image %d failed — copying previous", session_id, i + 1)
-            shutil.copy(prev_path, img_path)
-
-        with lock:
-            image_paths[i] = img_path
-            counters["img"] = counters.get("img", 0) + 1
-
-        with _status_lock:
-            data = load_session(session_id) or {}
-            done = data.get("images_done", [])
-            if i not in done:
-                done.append(i)
-            data["images_done"]     = done
-            data["last_heartbeat"]  = time.time()
-            data["status"]          = "generating"
-            data["progress"]        = 5 + int((counters.get("img", 0) / TOTAL_IMGS) * 35)
-            data["current_step"]    = f"Images ext. {i+1}/13 • Gemini {counters.get('gimg',0)}/7 • Audio {counters.get('aud',0)}/10"
-            save_session(session_id, data)
-
-
-# ---------------------------------------------------------------------------
-# Phase 2a-B — Gemini Flash image generation: images 13 to 19 (parallel)
-# ---------------------------------------------------------------------------
-
-def _generate_one_gemini_image(prompt: str, reference_path: str,
-                                max_retries: int = 3) -> bytes:
-    """Call Gemini 2.0 Flash image generation with the character image as context."""
-    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-           "gemini-2.0-flash-preview-image-generation:generateContent")
-    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
-    b64_ref = _encode_b64(reference_path)
-    payload = {
-        "contents": [{
-            "parts": [
-                {"inlineData": {"mimeType": "image/jpeg", "data": b64_ref}},
-                {"text": f"Using the person from the reference photo, generate: {prompt}"},
-            ]
-        }],
-        "generationConfig": {"responseModalities": ["IMAGE"]},
-    }
-
-    last_err = None
-    for attempt in range(max_retries):
+    for attempt in range(3):
         try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=120)
+            resp = requests.post(IMAGE_EDIT_URL,
+                json={"prompt": prompt, "image": _encode_b64(character_image_path)},
+                timeout=120)
             resp.raise_for_status()
-            data = resp.json()
-            parts = data["candidates"][0]["content"]["parts"]
-            for part in parts:
-                if "inlineData" in part:
-                    raw = base64.b64decode(part["inlineData"]["data"])
-                    if len(raw) < 5000:
-                        raise ValueError(f"Gemini image too small ({len(raw)} bytes)")
-                    return raw
-            raise ValueError("No image part in Gemini response")
-        except Exception as e:
-            last_err = e
-            wait = 2 ** attempt
-            logger.warning("[Gemini-img] Attempt %d/%d failed: %s — retry in %ds",
-                           attempt + 1, max_retries, e, wait)
-            if attempt < max_retries - 1:
-                time.sleep(wait)
-
-    raise RuntimeError(f"Gemini image gen failed after {max_retries} attempts: {last_err}")
-
-
-def generate_images_gemini(session_id: str, character_image_path: str,
-                            all_prompts: list[str], counters: dict,
-                            lock: threading.Lock, image_paths: list) -> None:
-    """
-    Generates images 13..19 using Gemini Flash image generation.
-    Each image uses the character reference photo as context.
-    Runs in parallel with the external API thread — both start simultaneously.
-    """
-    def _do_one(i: int) -> tuple[int, str]:
-        prompt   = all_prompts[i]
-        img_path = os.path.join(session_dir(session_id), f"image_{i:02d}.jpg")
-        try:
-            raw = _generate_one_gemini_image(prompt, character_image_path)
+            ct = resp.headers.get("content-type", "")
+            if "image" in ct:
+                raw = resp.content
+            else:
+                d   = resp.json()
+                b64 = d.get("image") or d.get("data") or d.get("result", "")
+                if isinstance(b64, str) and b64.startswith("data:"):
+                    b64 = b64.split(",", 1)[1]
+                raw = base64.b64decode(b64)
+            if len(raw) < 5000:
+                raise ValueError(f"Image too small ({len(raw)} bytes)")
             with open(img_path, "wb") as f:
                 f.write(raw)
-            logger.info("[%s] Gemini-image %d/7 OK", session_id, i - EXTERNAL_IMG_COUNT + 1)
+            success = True
+            logger.info("[%s] Image %02d OK (attempt %d)", session_id, i, attempt + 1)
+            break
         except Exception as e:
-            logger.error("[%s] Gemini-image %d failed: %s — copying character", session_id, i, e)
-            shutil.copy(character_image_path, img_path)
-        return i, img_path
+            logger.warning("[%s] Image %02d attempt %d: %s", session_id, i, attempt + 1, e)
+            if attempt < 2:
+                time.sleep(2 ** attempt)
 
-    gemini_indices = list(range(EXTERNAL_IMG_COUNT, TOTAL_IMGS))  # 13-19
+    if not success:
+        logger.error("[%s] Image %02d failed — copying character image", session_id, i)
+        shutil.copy(character_image_path, img_path)
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(_do_one, i): i for i in gemini_indices}
-        for future in as_completed(futures):
-            i, img_path = future.result()
-            with lock:
-                image_paths[i] = img_path
-                counters["gimg"] = counters.get("gimg", 0) + 1
+    with lock:
+        image_paths[i] = img_path
+        counters["img"] = counters.get("img", 0) + 1
+        total_done = counters["img"]
 
-            with _status_lock:
-                data = load_session(session_id) or {}
-                done = data.get("images_done", [])
-                if i not in done:
-                    done.append(i)
-                data["images_done"]     = done
-                data["last_heartbeat"]  = time.time()
-                data["current_step"]    = f"Images ext. {counters.get('img',0)}/13 • Gemini {counters.get('gimg',0)}/7 • Audio {counters.get('aud',0)}/10"
-                save_session(session_id, data)
+    with _status_lock:
+        data = load_session(session_id) or {}
+        done = data.get("images_done", [])
+        if i not in done:
+            done.append(i)
+        data["images_done"]    = done
+        data["last_heartbeat"] = time.time()
+        data["status"]         = "generating"
+        data["progress"]       = 5 + int((total_done / TOTAL_IMGS) * 35)
+        data["current_step"]   = (
+            f"Images {total_done}/{TOTAL_IMGS} • "
+            f"Audio {counters.get('aud', 0)}/10"
+        )
+        save_session(session_id, data)
+
+
+def generate_all_images(session_id: str, character_image_path: str,
+                         all_prompts: list[str], counters: dict,
+                         lock: threading.Lock, image_paths: list) -> None:
+    """
+    Generate all 20 images using the external edit API.
+    4 sections of 5 images run in parallel (max_workers=5 concurrent requests).
+    Every image uses the ORIGINAL character_image_path as reference — no chaining.
+    """
+    # Build sections: [[0,1,2,3,4], [5,6,7,8,9], [10,11,12,13,14], [15,16,17,18,19]]
+    sections = [
+        list(range(s * SECTION_SIZE, s * SECTION_SIZE + SECTION_SIZE))
+        for s in range(N_SECTIONS)
+    ]
+
+    def run_section(indices: list[int]) -> None:
+        """Run one section: submit all 5 images to a thread pool simultaneously."""
+        with ThreadPoolExecutor(max_workers=SECTION_SIZE) as pool:
+            futures = [
+                pool.submit(
+                    _generate_one_image,
+                    session_id, idx, all_prompts[idx],
+                    character_image_path, counters, lock, image_paths
+                )
+                for idx in indices
+            ]
+            for f in as_completed(futures):
+                try:
+                    f.result()
+                except Exception as e:
+                    logger.error("[%s] Section image error: %s", session_id, e)
+
+    # Launch all 4 sections simultaneously
+    section_threads = [
+        threading.Thread(target=run_section, args=(sec,), daemon=True)
+        for sec in sections
+    ]
+    for t in section_threads:
+        t.start()
+    for t in section_threads:
+        t.join()
 
 
 # ---------------------------------------------------------------------------
@@ -555,12 +587,13 @@ def _generate_gemini_tts(text: str, max_retries: int = 5) -> bytes:
                 time.sleep(wait)
     raise RuntimeError(f"TTS failed after {max_retries} attempts: {last_err}")
 
+
 def _generate_one_audio(session_id: str, i: int, seg: dict,
                          counters: dict, lock: threading.Lock) -> str:
     audio_path = os.path.join(session_dir(session_id), f"audio_{i:02d}.wav")
     text = seg.get("text", "").strip()
     if not text:
-        _write_silent_wav(audio_path); 
+        _write_silent_wav(audio_path)
     else:
         try:
             wav = _generate_gemini_tts(text)
@@ -587,6 +620,7 @@ def _generate_one_audio(session_id: str, i: int, seg: dict,
         save_session(session_id, data)
     return audio_path
 
+
 def generate_audio(session_id: str, session_data: dict,
                    counters: dict, lock: threading.Lock) -> list[str]:
     segments    = session_data["segments"]
@@ -602,6 +636,7 @@ def generate_audio(session_id: str, session_data: dict,
 
 # ---------------------------------------------------------------------------
 # Phase 3 — Video assembly via pure ffmpeg
+# 1 audio segment covers EXACTLY 2 images — no overflow
 # ---------------------------------------------------------------------------
 
 def _find_font(size: int = 34):
@@ -653,16 +688,21 @@ def _kb_vf(dur: float, direction: str = "fwd") -> str:
 
 def assemble_video(session_id: str, image_paths: list[str],
                    audio_paths: list[str], session_data: dict) -> str:
+    """
+    Assemble video: 10 segments, each segment uses exactly 2 images.
+    image index for segment si: si*2 and si*2+1  (no overflow — 10*2 = 20 images total)
+    """
     ff   = _ffmpeg()
     sdir = session_dir(session_id)
     update_status(session_id, "assembling", 72, "Assemblage de la vidéo en cours...")
     segments = session_data["segments"]
     clips    = []
 
-    for si, seg in enumerate(segments):
-        update_status(session_id, "assembling", 72 + int((si/10)*24),
+    for si in range(10):
+        update_status(session_id, "assembling", 72 + int((si / 10) * 24),
                       f"Rendu segment {si+1}/10...", last_heartbeat=time.time())
 
+        # Audio for this segment
         ap = audio_paths[si] if si < len(audio_paths) else None
         if not ap or not os.path.exists(ap):
             ap = os.path.join(sdir, f"audio_{si:02d}.wav")
@@ -670,19 +710,24 @@ def assemble_video(session_id: str, image_paths: list[str],
         dur = _wav_duration(ap)
         if dur < 0.5:
             try:
-                wav = _generate_gemini_tts(seg["text"], max_retries=3)
+                wav = _generate_gemini_tts(segments[si]["text"], max_retries=3)
                 with open(ap, "wb") as f: f.write(wav)
                 dur = _wav_duration(ap)
             except Exception:
                 _write_silent_wav(ap, 7.0); dur = 7.0
 
-        img_dur = max(dur / 2.0, 1.0)
+        # Each audio covers exactly 2 images — no overflow, no shared images between segments
+        img_dur = max(dur / 2.0, 1.0)   # each of the 2 images gets half the audio duration
         baked   = []
         for off in range(2):
-            idx  = si * 2 + off
-            src  = image_paths[idx] if idx < len(image_paths) and image_paths[idx] else image_paths[-1]
-            dst  = os.path.join(sdir, f"sub_{idx:02d}.jpg")
-            _bake_subtitle(src, seg["text"], dst)
+            idx = si * 2 + off          # 0→(0,1), 1→(2,3), ..., 9→(18,19) — exactly 20 images
+            # Guard: idx must be in [0, TOTAL_IMGS-1]
+            idx = max(0, min(idx, TOTAL_IMGS - 1))
+            src = (image_paths[idx]
+                   if idx < len(image_paths) and image_paths[idx]
+                   else image_paths[0])
+            dst = os.path.join(sdir, f"sub_{si:02d}_{off}.jpg")
+            _bake_subtitle(src, segments[si]["text"], dst)
             baked.append(dst)
 
         d   = "fwd" if si % 2 == 0 else "rev"
@@ -716,7 +761,7 @@ def assemble_video(session_id: str, image_paths: list[str],
 
 
 # ---------------------------------------------------------------------------
-# Main production runner — 3 parallel threads
+# Main production runner — 2 parallel threads (images + audio)
 # ---------------------------------------------------------------------------
 
 def run_production(session_id: str, character_image_path: str):
@@ -732,36 +777,30 @@ def run_production(session_id: str, character_image_path: str):
             data["character_image_path"] = character_image_path
             save_session(session_id, data)
 
+        # 20 prompts: all_prompts[0..19]
         all_prompts = [p for seg in session_data["segments"] for p in seg["image_prompts"]]
-        # all_prompts[0..12]  → External API
-        # all_prompts[13..19] → Gemini Flash
+        # Ensure exactly 20 prompts
+        while len(all_prompts) < TOTAL_IMGS:
+            all_prompts.append(f"WIDE SHOT - the person from the reference photo, photorealistic, 8k, cinematic")
+        all_prompts = all_prompts[:TOTAL_IMGS]
 
         lock         = threading.Lock()
-        counters     = {"img": 0, "gimg": 0, "aud": 0}
+        counters     = {"img": 0, "aud": 0}
         image_paths  = [None] * TOTAL_IMGS
 
         update_status(session_id, "generating", 5,
-                      "3 threads démarrés : ext. images 0-12 • Gemini images 13-19 • audio TTS",
+                      "2 threads démarrés : images (4 sections parallèles) • audio TTS",
                       images_done=[], audio_done=[])
 
-        results = {"img_ext": None, "img_gem": None, "audio": None,
-                   "err_ext": None, "err_gem": None, "err_aud": None}
+        results = {"audio": None, "err_img": None, "err_aud": None}
 
-        def run_ext():
+        def run_img():
             try:
-                generate_images_external(session_id, character_image_path,
-                                         all_prompts, counters, lock, image_paths)
+                generate_all_images(session_id, character_image_path,
+                                    all_prompts, counters, lock, image_paths)
             except Exception as e:
-                results["err_ext"] = e
-                logger.error("[%s] External-images thread: %s", session_id, e, exc_info=True)
-
-        def run_gem():
-            try:
-                generate_images_gemini(session_id, character_image_path,
-                                       all_prompts, counters, lock, image_paths)
-            except Exception as e:
-                results["err_gem"] = e
-                logger.error("[%s] Gemini-images thread: %s", session_id, e, exc_info=True)
+                results["err_img"] = e
+                logger.error("[%s] Images thread: %s", session_id, e, exc_info=True)
 
         def run_aud():
             try:
@@ -770,11 +809,10 @@ def run_production(session_id: str, character_image_path: str):
                 results["err_aud"] = e
                 logger.error("[%s] Audio thread: %s", session_id, e, exc_info=True)
 
-        t1 = threading.Thread(target=run_ext, daemon=True)
-        t2 = threading.Thread(target=run_gem, daemon=True)
-        t3 = threading.Thread(target=run_aud, daemon=True)
-        t1.start(); t2.start(); t3.start()
-        t1.join();  t2.join();  t3.join()
+        t1 = threading.Thread(target=run_img, daemon=True)
+        t2 = threading.Thread(target=run_aud, daemon=True)
+        t1.start(); t2.start()
+        t1.join();  t2.join()
 
         audio_paths = results["audio"] or []
 

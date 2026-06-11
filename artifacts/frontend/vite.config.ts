@@ -10,13 +10,7 @@ const isBuild  = process.argv.includes("build");
 const rawPort  = process.env.PORT;
 const basePath = process.env.BASE_PATH || "/";
 
-if (!isBuild && !rawPort) {
-  throw new Error(
-    "PORT environment variable is required for dev mode but was not provided.",
-  );
-}
-
-const port = Number(rawPort || "18130");
+const port = isBuild ? 8081 : Number(rawPort || "8081");
 
 if (!isBuild && (Number.isNaN(port) || port <= 0)) {
   throw new Error(`Invalid PORT value: "${rawPort}"`);
