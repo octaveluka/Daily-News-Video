@@ -651,28 +651,13 @@ def _find_font(size: int = 34):
             except Exception: pass
     return ImageFont.load_default()
 
-def _bake_subtitle(src: str, text: str, dst: str):
-    try: img = PILImage.open(src).convert("RGB")
-    except Exception: img = PILImage.new("RGB", (VIDEO_W, VIDEO_H), (20,20,20))
-    img  = img.resize((VIDEO_W, VIDEO_H), PILImage.LANCZOS)
-    draw = ImageDraw.Draw(img)
-    font = _find_font(34)
-    words = text.split()
-    mid   = max(1, len(words) // 2)
-    lines = [" ".join(words[:mid])]
-    if words[mid:]: lines.append(" ".join(words[mid:]))
-    y = VIDEO_H - 110
-    for line in lines:
-        try:
-            bbox = draw.textbbox((0,0), line, font=font)
-            tw = bbox[2] - bbox[0]
-        except AttributeError:
-            tw = len(line) * 18
-        x = (VIDEO_W - tw) // 2
-        draw.rectangle([x-8, y-4, x+tw+8, y+40], fill=(0,0,0,140))
-        draw.text((x+2, y+2), line, font=font, fill=(0,0,0,255))
-        draw.text((x,   y  ), line, font=font, fill=(255,255,255,255))
-        y += 46
+def _prepare_image(src: str, dst: str):
+    """Resize image to video dimensions — no subtitle overlay."""
+    try:
+        img = PILImage.open(src).convert("RGB")
+    except Exception:
+        img = PILImage.new("RGB", (VIDEO_W, VIDEO_H), (20, 20, 20))
+    img = img.resize((VIDEO_W, VIDEO_H), PILImage.LANCZOS)
     img.save(dst, "JPEG", quality=90)
 
 _KB_SCALE = f"{int(VIDEO_W*1.1)}:{int(VIDEO_H*1.1)}"
@@ -726,8 +711,8 @@ def assemble_video(session_id: str, image_paths: list[str],
             src = (image_paths[idx]
                    if idx < len(image_paths) and image_paths[idx]
                    else image_paths[0])
-            dst = os.path.join(sdir, f"sub_{si:02d}_{off}.jpg")
-            _bake_subtitle(src, segments[si]["text"], dst)
+            dst = os.path.join(sdir, f"frm_{si:02d}_{off}.jpg")
+            _prepare_image(src, dst)
             baked.append(dst)
 
         d   = "fwd" if si % 2 == 0 else "rev"
