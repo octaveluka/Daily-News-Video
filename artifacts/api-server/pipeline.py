@@ -684,21 +684,42 @@ def _generate_one_audio(session_id: str, i: int, seg: dict,
         _write_silent_wav(audio_path, 7.5)
     else:
         success = False
-        for outer in range(2):          # two outer rounds before giving up
+        for attempt in range(8):            # up to 8 attempts total
             try:
-                wav = _generate_gemini_tts(text, max_retries=5)
+                wav = _generate_gemini_tts(text, max_retries=1)
+
+                # ── Validate the file right after writing ──
+                dur = _wav_duration(wav)
+                rms = _wav_rms(wav)
+                if dur < MIN_AUDIO_DURATION:
+                    raise ValueError(f"Fichier trop court après écriture: {dur:.2f}s")
+                if rms < MIN_AUDIO_RMS:
+                    raise ValueError(f"Fichier silencieux après écriture: RMS={rms:.1f}")
+
                 with open(audio_path, "wb") as f:
                     f.write(wav)
+
+                # Double-check the saved file is readable and valid
+                saved_dur = _wav_duration(audio_path)
+                saved_rms = _wav_rms(open(audio_path, "rb").read())
+                if saved_dur < MIN_AUDIO_DURATION or saved_rms < MIN_AUDIO_RMS:
+                    raise ValueError(
+                        f"Fichier sauvegardé invalide: dur={saved_dur:.2f}s rms={saved_rms:.1f}")
+
+                logger.info("[%s] Audio %02d ✓ attempt=%d dur=%.2fs rms=%.0f",
+                            session_id, i, attempt + 1, saved_dur, saved_rms)
                 success = True
                 break
+
             except Exception as e:
-                logger.error("[%s] Audio %d outer-attempt %d failed: %s",
-                             session_id, i, outer + 1, e)
-                if outer == 0:
-                    time.sleep(3)
+                wait = min(2 ** attempt, 20)
+                logger.warning("[%s] Audio %02d attempt %d/8 failed: %s — retry in %ds",
+                               session_id, i, attempt + 1, e, wait)
+                if attempt < 7:
+                    time.sleep(wait)
 
         if not success:
-            logger.error("[%s] Audio %d: all attempts exhausted → silent placeholder", session_id, i)
+            logger.error("[%s] Audio %02d: all 8 attempts failed → silent placeholder", session_id, i)
             _write_silent_wav(audio_path, 7.5)
 
     with lock:
@@ -854,47 +875,6 @@ def assemble_video(session_id: str, image_paths: list[str],
     ff      = _ffmpeg()
     sdir    = session_dir(session_id)
     segments = session_data["segments"]
-
-    # ── Pre-assembly pass: check files exist and are non-silent ────────────
-    update_status(session_id, "assembling", 70,
-                  "Vérification des fichiers audio…")
-    bad = []
-    for si in range(10):
-        ap = (audio_paths[si]
-              if si < len(audio_paths) and audio_paths[si]
-              else os.path.join(sdir, f"audio_{si:02d}.wav"))
-        if not os.path.exists(ap):
-            bad.append(si)
-            continue
-        dur_check = _wav_duration(ap)
-        rms_check = _wav_rms(open(ap, "rb").read())
-        if dur_check < MIN_AUDIO_DURATION or rms_check < MIN_AUDIO_RMS:
-            logger.warning("[%s] Pre-assembly: audio %02d invalid (dur=%.2fs rms=%.0f) — regen",
-                           session_id, si, dur_check, rms_check)
-            bad.append(si)
-
-    if bad:
-        logger.info("[%s] Pre-assembly regen for %d audio files: %s", session_id, len(bad), bad)
-        update_status(session_id, "assembling", 71,
-                      f"Regénération de {len(bad)} audio(s) invalides…")
-
-        def _regen(si: int):
-            ap   = os.path.join(sdir, f"audio_{si:02d}.wav")
-            text = segments[si]["text"].strip() if si < len(segments) else ""
-            if not text:
-                return
-            try:
-                wav = _generate_gemini_tts(text, max_retries=5)
-                with open(ap, "wb") as f:
-                    f.write(wav)
-                if si < len(audio_paths):
-                    audio_paths[si] = ap
-                logger.info("[%s] Pre-assembly regen %02d OK", session_id, si)
-            except Exception as e:
-                logger.error("[%s] Pre-assembly regen %02d failed: %s", session_id, si, e)
-
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            list(pool.map(_regen, bad))
 
     update_status(session_id, "assembling", 72, "Montage des segments vidéo…")
     clips = []
