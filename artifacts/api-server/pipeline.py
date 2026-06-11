@@ -319,28 +319,50 @@ def _extract_json(text: str) -> dict:
         return json.loads(m.group())
     raise ValueError(f"No JSON found: {text[:200]}")
 
-_NARRATIVE_PROMPT_TEMPLATE = """Tu es le narrateur d'un documentaire journalistique (style Al Jazeera / Vice News / France 24).
-Tu écris en français un récit en 10 segments pour une vidéo virale sur : "{topic}"
+_NARRATIVE_PROMPT_TEMPLATE = """Tu es la voix off d'un grand documentaire d'information télévisé (style BBC World, Al Jazeera English, France 24, Vice News).
+Tu écris en français un script de narration en 10 segments pour une vidéo sur : "{topic}"
 
-═══ RÈGLE ABSOLUE — STYLE DOCUMENTAIRE ═══
-• Chaque segment = FAITS, ÉVÉNEMENTS, CONTEXTE HISTORIQUE, CITATIONS de personnes impliquées
-• INTERDIT : décrire les gestes, mouvements ou sensations physiques d'un personnage fictif
-• INTERDIT : "elle ouvre les yeux", "il respire profondément", "son cœur bat"
-• OBLIGATOIRE : "Un mouvement prend de l'ampleur", citations directes, enjeux géopolitiques/sociaux
-• Chaque segment = 30 à 45 mots, assez long pour une narration audio fluide
+═══ VOIX OFF — CE QUE C'EST ═══
+La voix off décrit les faits, les événements, les enjeux. Elle parle AU SPECTATEUR, en 3e personne, comme un journaliste qui explique le monde.
+Exemple : "En dix ans, la superficie des forêts amazoniennes a diminué de 17 %. Chaque année, des millions d'hectares disparaissent sous les bulldozers de l'agro-industrie, menaçant l'équilibre climatique de toute la planète."
 
-═══ EXEMPLE PARFAIT ═══
-"Depuis quelque temps, un mouvement inédit prend de l'ampleur. À la suite du vote d'une loi historique accordant la nationalité béninoise aux afro-descendants, des milliers de personnes venues d'Haïti et des Caraïbes font le voyage pour renouer avec leurs racines."
+═══ INTERDICTIONS ABSOLUES ═══
+✗ JAMAIS de citation entre guillemets ("les gens disent que...", "selon lui :", "elle déclare :")
+✗ JAMAIS de discours direct ou indirect ("il affirme que", "elle répond :", "les habitants disent :")
+✗ JAMAIS d'attribution de parole à quelqu'un ("d'après X", "comme le confie Y")
+✗ JAMAIS de dialogue, de question rhétorique adressée à un personnage
+✗ JAMAIS de description de gestes ou sensations physiques ("il respire", "elle ouvre les yeux")
+✗ JAMAIS de "nous", de "vous" — uniquement la 3e personne
+
+═══ OBLIGATOIRE ═══
+✓ Faits chiffrés, dates, lieux géographiques précis
+✓ Contexte historique, géopolitique, social, économique
+✓ Tensions, enjeux, conséquences concrètes pour les populations
+✓ Narration fluide, continue — chaque segment enchaîne sur le suivant
+✓ 35 à 50 mots par segment — assez dense pour une narration audio de 8 secondes
+
+═══ STRUCTURE DES 10 SEGMENTS ═══
+0 — Accroche choc : un fait frappant pour captiver immédiatement
+1 — Contexte : comment on en est arrivé là
+2 — Ampleur du phénomène : chiffres, géographie
+3 — Causes profondes
+4 — Conséquences humaines concrètes
+5 — Acteurs en jeu (États, organisations, mouvements)
+6 — Tournant ou point de bascule
+7 — Réactions internationales ou institutionnelles
+8 — Perspectives et enjeux futurs
+9 — Chute : formule forte qui résonne
 
 ═══ RÈGLE PROMPTS IMAGE ═══
-Chaque prompt DOIT :
-1. Mentionner "the person from the reference photo"
-2. Décrire exactement le LIEU et le DÉCOR correspondant aux paroles du segment
-3. Être très différent des autres (type de plan, lumière, décor différents)
-Types : WIDE SHOT | CLOSE-UP | EXTREME CLOSE-UP | AERIAL VIEW | LOW ANGLE | SILHOUETTE | DUTCH ANGLE | OVER-THE-SHOULDER | MEDIUM SHOT | TWO-SHOT
+Chaque prompt image DOIT :
+1. Commencer par le TYPE DE PLAN en majuscules
+2. Mentionner "the person from the reference photo"
+3. Décrire le LIEU exact correspondant au segment (pas un lieu générique)
+4. Être différent des 19 autres (plan, lumière, décor uniques)
+Types : WIDE SHOT | CLOSE-UP | EXTREME CLOSE-UP | AERIAL VIEW | LOW ANGLE | SILHOUETTE | DUTCH ANGLE | OVER-THE-SHOULDER | MEDIUM SHOT | TWO-SHOT | TRACKING SHOT | POV SHOT
 
 FORMAT JSON STRICT (sans markdown, sans commentaires) :
-{{"title":"...","description":"...","hashtags":["#...","#...","#...","#...","#..."],"segments":[{{"index":0,"text":"...30-45 mots...","image_prompts":["TYPE - the person from the reference photo [action] in [décor précis], [lumière], photorealistic, 8k, cinematic","TYPE - the person from the reference photo [autre action] in [autre décor], [lumière], photorealistic, 8k, cinematic"]}},{{"index":1,...}},{{"index":2,...}},{{"index":3,...}},{{"index":4,...}},{{"index":5,...}},{{"index":6,...}},{{"index":7,...}},{{"index":8,...}},{{"index":9,"text":"...chute émotionnelle ou espoir...","image_prompts":["...","..."]}}]}}"""
+{{"title":"...","description":"...","hashtags":["#...","#...","#...","#...","#..."],"segments":[{{"index":0,"text":"...35-50 mots de narration documentaire pure...","image_prompts":["TYPE - the person from the reference photo [action] in [lieu précis], [lumière], photorealistic, 8k, cinematic","TYPE - the person from the reference photo [action] in [lieu précis], [lumière], photorealistic, 8k, cinematic"]}},{{"index":1,...}},{{"index":2,...}},{{"index":3,...}},{{"index":4,...}},{{"index":5,...}},{{"index":6,...}},{{"index":7,...}},{{"index":8,...}},{{"index":9,"text":"...","image_prompts":["...","..."]}}]}}"""
 
 def _fallback_script(topic: str) -> dict:
     t = topic[:60]
