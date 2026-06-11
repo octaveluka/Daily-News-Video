@@ -129,46 +129,56 @@ def load_session(session_id: str) -> dict | None:
 
 
 def save_session(session_id: str, data: dict):
+    conn = None
     try:
         conn = _get_db_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO sessions (session_id, topic, title, status, progress,
-                                         current_step, error, video_path, created_at,
-                                         last_heartbeat, data)
-                    VALUES (%(sid)s, %(topic)s, %(title)s, %(status)s, %(progress)s,
-                            %(step)s, %(error)s, %(vpath)s,
-                            COALESCE(%(cat)s::timestamptz, NOW()),
-                            %(hb)s, %(data)s)
-                    ON CONFLICT (session_id) DO UPDATE SET
-                        topic          = EXCLUDED.topic,
-                        title          = EXCLUDED.title,
-                        status         = EXCLUDED.status,
-                        progress       = EXCLUDED.progress,
-                        current_step   = EXCLUDED.current_step,
-                        error          = EXCLUDED.error,
-                        video_path     = EXCLUDED.video_path,
-                        last_heartbeat = EXCLUDED.last_heartbeat,
-                        data           = EXCLUDED.data
-                """, {
-                    "sid":     session_id,
-                    "topic":   data.get("topic", ""),
-                    "title":   data.get("title", ""),
-                    "status":  data.get("status", "pending"),
-                    "progress": data.get("progress", 0),
-                    "step":    data.get("current_step", ""),
-                    "error":   data.get("error"),
-                    "vpath":   data.get("video_path"),
-                    "cat":     data.get("created_at"),
-                    "hb":      data.get("last_heartbeat", 0),
-                    "data":    json.dumps(data, ensure_ascii=False),
-                })
-            conn.commit()
-        finally:
-            conn.close()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO sessions (session_id, topic, title, status, progress,
+                                     current_step, error, video_path, created_at,
+                                     last_heartbeat, data)
+                VALUES (%(sid)s, %(topic)s, %(title)s, %(status)s, %(progress)s,
+                        %(step)s, %(error)s, %(vpath)s,
+                        COALESCE(%(cat)s::timestamptz, NOW()),
+                        %(hb)s, %(data)s)
+                ON CONFLICT (session_id) DO UPDATE SET
+                    topic          = EXCLUDED.topic,
+                    title          = EXCLUDED.title,
+                    status         = EXCLUDED.status,
+                    progress       = EXCLUDED.progress,
+                    current_step   = EXCLUDED.current_step,
+                    error          = EXCLUDED.error,
+                    video_path     = EXCLUDED.video_path,
+                    last_heartbeat = EXCLUDED.last_heartbeat,
+                    data           = EXCLUDED.data
+            """, {
+                "sid":     session_id,
+                "topic":   data.get("topic", ""),
+                "title":   data.get("title", ""),
+                "status":  data.get("status", "pending"),
+                "progress": data.get("progress", 0),
+                "step":    data.get("current_step", ""),
+                "error":   data.get("error"),
+                "vpath":   data.get("video_path"),
+                "cat":     data.get("created_at"),
+                "hb":      float(data.get("last_heartbeat") or 0),
+                "data":    psycopg2.extras.Json(data),
+            })
+        conn.commit()
     except Exception as e:
-        logger.error("[DB] save_session %s: %s", session_id, e)
+        logger.error("[DB] save_session %s: %s", session_id, e, exc_info=True)
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        raise
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def list_sessions() -> list[dict]:
