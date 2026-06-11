@@ -13,7 +13,7 @@ from pipeline import (
     auto_resume_stalled_sessions,
     create_bundle_zip,
     repair_audio_files,
-    audio_file_has_speech,
+    _wav_duration, MIN_AUDIO_DURATION,
     SESSIONS_DIR,
 )
 
@@ -246,12 +246,13 @@ def audio_scan(session_id: str):
             results.append({"index": i, "status": "missing"})
             continue
         size = os.path.getsize(ap)
-        ok, reason = audio_file_has_speech(ap)
+        dur  = _wav_duration(ap)
+        ok   = dur >= MIN_AUDIO_DURATION
         results.append({
-            "index":  i,
-            "status": "ok" if ok else "no_speech",
-            "reason": reason,
-            "size":   size,
+            "index":    i,
+            "status":   "ok" if ok else "too_short",
+            "duration": round(dur, 2),
+            "size":     size,
         })
     bad = [r["index"] for r in results if r["status"] != "ok"]
     return jsonify({"session_id": session_id, "results": results, "bad_indices": bad}), 200

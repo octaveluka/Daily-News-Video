@@ -13,9 +13,10 @@ Audio validation: min 2 s, RMS silence check, up to 5 retries.
 Ken Burns: 1.03× zoom (subtle).
 """
 
-import io, os, json, uuid, wave, base64, array, shutil, zipfile
+import io, os, json, uuid, wave, base64, array, shutil, zipfile, asyncio
 import logging, subprocess, threading, time, re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import edge_tts
 
 import requests
 import psycopg2
@@ -43,7 +44,7 @@ except OSError:
 
 TEXT_API_URL   = "https://delfaapiai.vercel.app/ai/copilot"
 IMAGE_EDIT_URL = "https://gem-tw6a.onrender.com/edit"
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+TTS_VOICE = "fr-FR-HenriNeural"
 
 FPS          = 24
 TOTAL_IMGS   = 20
@@ -496,40 +497,17 @@ def generate_all_images(session_id: str, character_image_path: str,
 
 
 # ---------------------------------------------------------------------------
-# Phase 2b — Audio: Gemini TTS — strict validation, min 2 s, RMS check
+# Phase 2b — Audio: edge-tts (fr-FR-HenriNeural)
 # ---------------------------------------------------------------------------
-
-def _pcm_to_wav(pcm: bytes, rate: int = 24000, ch: int = 1, sw: int = 2) -> bytes:
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(ch); wf.setsampwidth(sw); wf.setframerate(rate)
-        wf.writeframes(pcm)
-    return buf.getvalue()
 
 def _wav_duration(wav_bytes_or_path) -> float:
     try:
-        if isinstance(wav_bytes_or_path, (str, bytes)):
-            if isinstance(wav_bytes_or_path, str):
-                with wave.open(wav_bytes_or_path, "r") as wf:
-                    return wf.getnframes() / (wf.getframerate() or 1)
-            else:
-                with wave.open(io.BytesIO(wav_bytes_or_path), "r") as wf:
-                    return wf.getnframes() / (wf.getframerate() or 1)
-    except Exception:
-        return 0.0
-
-def _wav_rms(wav_bytes: bytes) -> float:
-    """Return RMS amplitude of WAV audio."""
-    try:
-        with wave.open(io.BytesIO(wav_bytes), "r") as wf:
-            sw = wf.getsampwidth()
-            frames = wf.readframes(wf.getnframes())
-        if sw != 2:
-            return 999.0   # assume non-silent for non-16-bit
-        samples = array.array("h", frames)
-        if not samples:
-            return 0.0
-        return (sum(s * s for s in samples) / len(samples)) ** 0.5
+        if isinstance(wav_bytes_or_path, str):
+            with wave.open(wav_bytes_or_path, "r") as wf:
+                return wf.getnframes() / (wf.getframerate() or 1)
+        else:
+            with wave.open(io.BytesIO(wav_bytes_or_path), "r") as wf:
+                return wf.getnframes() / (wf.getframerate() or 1)
     except Exception:
         return 0.0
 
@@ -539,139 +517,12 @@ def _write_silent_wav(path: str, duration: float = 7.5, rate: int = 24000):
         wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(rate)
         wf.writeframes(array.array("h", [0] * n).tobytes())
 
-MIN_AUDIO_DURATION   = 2.0    # seconds — below this we retry
-MIN_AUDIO_RMS        = 50.0   # overall RMS threshold
-SPEECH_CHUNK_MS      = 400    # ms per energy window for speech detection
-SPEECH_MIN_LOUD_FRAC = 0.25   # at least 25 % of chunks must be "loud"
-SPEECH_MIN_LOUD_RMS  = 200    # chunk RMS considered "loud"
-SPEECH_MIN_VARIANCE  = 1500   # variance of chunk-RMS must be above this
+MIN_AUDIO_DURATION = 2.0  # seconds — safety floor used during assembly
 
 
-def _has_speech(wav_bytes: bytes) -> tuple[bool, str]:
-    """
-    Detect whether a WAV file contains actual speech (not silence/noise).
-
-    Strategy: split into 400 ms windows, compute RMS per window.
-      • Real speech  → energy varies over time (high variance) AND
-                        several windows are "loud" (RMS > 200)
-      • Silence/noise → all windows at similar (low) energy (low variance)
-
-    Returns (ok: bool, reason: str)
-    """
-    try:
-        with wave.open(io.BytesIO(wav_bytes), "r") as wf:
-            rate  = wf.getframerate()
-            sw    = wf.getsampwidth()
-            nch   = wf.getnchannels()
-            frames = wf.readframes(wf.getnframes())
-    except Exception as e:
-        return False, f"WAV parse error: {e}"
-
-    if sw != 2:
-        # Non-16-bit — can't validate reliably, assume OK
-        return True, "non-16bit, skip"
-
-    # Collapse to mono if stereo
-    if nch == 2:
-        all_s = array.array("h", frames)
-        mono  = array.array("h", [int((all_s[i] + all_s[i+1]) / 2) for i in range(0, len(all_s)-1, 2)])
-        frames = mono.tobytes()
-
-    samples_per_chunk = int(rate * SPEECH_CHUNK_MS / 1000)
-    all_samples = array.array("h", frames)
-    total = len(all_samples)
-    if total == 0:
-        return False, "empty audio"
-
-    chunk_rms_vals = []
-    for start in range(0, total, samples_per_chunk):
-        chunk = all_samples[start:start + samples_per_chunk]
-        if len(chunk) < samples_per_chunk // 4:
-            break
-        rms = (sum(s * s for s in chunk) / len(chunk)) ** 0.5
-        chunk_rms_vals.append(rms)
-
-    if not chunk_rms_vals:
-        return False, "no chunks"
-
-    n = len(chunk_rms_vals)
-    mean_rms  = sum(chunk_rms_vals) / n
-    variance  = sum((r - mean_rms) ** 2 for r in chunk_rms_vals) / n
-    loud_frac = sum(1 for r in chunk_rms_vals if r > SPEECH_MIN_LOUD_RMS) / n
-
-    ok = variance >= SPEECH_MIN_VARIANCE and loud_frac >= SPEECH_MIN_LOUD_FRAC
-    reason = (f"variance={variance:.0f} loud_frac={loud_frac:.2f} "
-              f"mean_rms={mean_rms:.0f} chunks={n}")
-    logger.debug("[speech-check] %s → %s", "OK" if ok else "NO-SPEECH", reason)
-    return ok, reason
-
-
-def audio_file_has_speech(path: str) -> tuple[bool, str]:
-    """Wrapper: read file from disk then run _has_speech."""
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-        return _has_speech(data)
-    except Exception as e:
-        return False, f"read error: {e}"
-
-
-def _generate_gemini_tts(text: str, max_retries: int = 5) -> bytes:
-    """Generate audio via Gemini TTS. Validates duration, RMS, and speech presence."""
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY not set")
-    clean = text.strip()
-    if not clean:
-        raise ValueError("Empty text")
-
-    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-           "gemini-2.5-flash-preview-tts:generateContent")
-    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
-    payload = {
-        "contents": [{"parts": [{"text": clean}]}],
-        "generationConfig": {
-            "responseModalities": ["AUDIO"],
-            "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Kore"}}},
-        },
-    }
-
-    last_err = None
-    for attempt in range(max_retries):
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=90)
-            resp.raise_for_status()
-            data = resp.json()
-            b64  = data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
-            if not b64:
-                raise ValueError("Empty audio data from Gemini")
-            raw = base64.b64decode(b64)
-            if len(raw) < 1000:
-                raise ValueError(f"Audio payload too small ({len(raw)} B)")
-            wav = raw if raw[:4] == b"RIFF" else _pcm_to_wav(raw)
-
-            # 1 — Duration check
-            dur = _wav_duration(wav)
-            if dur < MIN_AUDIO_DURATION:
-                raise ValueError(f"Audio too short: {dur:.2f}s < {MIN_AUDIO_DURATION}s")
-
-            # 2 — Global RMS (catches total silence / empty response)
-            rms = _wav_rms(wav)
-            if rms < MIN_AUDIO_RMS:
-                raise ValueError(f"Audio is silent (RMS={rms:.1f})")
-
-            logger.info("[TTS] ✓ attempt=%d dur=%.2fs rms=%.0f text=%.40s",
-                        attempt + 1, dur, rms, clean)
-            return wav
-
-        except Exception as e:
-            last_err = e
-            wait = min(2 ** attempt, 20)
-            logger.warning("[TTS] attempt %d/%d — %s — retry in %ds",
-                           attempt + 1, max_retries, e, wait)
-            if attempt < max_retries - 1:
-                time.sleep(wait)
-
-    raise RuntimeError(f"TTS failed after {max_retries} attempts: {last_err}")
+async def _edge_tts_to_mp3(text: str, mp3_path: str) -> None:
+    communicate = edge_tts.Communicate(text, TTS_VOICE)
+    await communicate.save(mp3_path)
 
 
 def _generate_one_audio(session_id: str, i: int, seg: dict,
@@ -683,43 +534,18 @@ def _generate_one_audio(session_id: str, i: int, seg: dict,
         logger.warning("[%s] Audio %d: empty text → silent placeholder", session_id, i)
         _write_silent_wav(audio_path, 7.5)
     else:
-        success = False
-        for attempt in range(8):            # up to 8 attempts total
+        mp3_path = audio_path.replace(".wav", ".mp3")
+        try:
+            asyncio.run(_edge_tts_to_mp3(text, mp3_path))
+            _run_ff([_ffmpeg(), "-y", "-i", mp3_path,
+                     "-ar", "24000", "-ac", "1", audio_path], timeout=60)
             try:
-                wav = _generate_gemini_tts(text, max_retries=1)
-
-                # ── Validate the file right after writing ──
-                dur = _wav_duration(wav)
-                rms = _wav_rms(wav)
-                if dur < MIN_AUDIO_DURATION:
-                    raise ValueError(f"Fichier trop court après écriture: {dur:.2f}s")
-                if rms < MIN_AUDIO_RMS:
-                    raise ValueError(f"Fichier silencieux après écriture: RMS={rms:.1f}")
-
-                with open(audio_path, "wb") as f:
-                    f.write(wav)
-
-                # Double-check the saved file is readable and valid
-                saved_dur = _wav_duration(audio_path)
-                saved_rms = _wav_rms(open(audio_path, "rb").read())
-                if saved_dur < MIN_AUDIO_DURATION or saved_rms < MIN_AUDIO_RMS:
-                    raise ValueError(
-                        f"Fichier sauvegardé invalide: dur={saved_dur:.2f}s rms={saved_rms:.1f}")
-
-                logger.info("[%s] Audio %02d ✓ attempt=%d dur=%.2fs rms=%.0f",
-                            session_id, i, attempt + 1, saved_dur, saved_rms)
-                success = True
-                break
-
-            except Exception as e:
-                wait = min(2 ** attempt, 20)
-                logger.warning("[%s] Audio %02d attempt %d/8 failed: %s — retry in %ds",
-                               session_id, i, attempt + 1, e, wait)
-                if attempt < 7:
-                    time.sleep(wait)
-
-        if not success:
-            logger.error("[%s] Audio %02d: all 8 attempts failed → silent placeholder", session_id, i)
+                os.remove(mp3_path)
+            except OSError:
+                pass
+            logger.info("[%s] Audio %02d ✓", session_id, i)
+        except Exception as e:
+            logger.error("[%s] Audio %02d failed: %s → silent placeholder", session_id, i, e)
             _write_silent_wav(audio_path, 7.5)
 
     with lock:
@@ -739,7 +565,7 @@ def generate_audio(session_id: str, session_data: dict,
                    counters: dict, lock: threading.Lock) -> list[str]:
     segments    = session_data["segments"]
     audio_paths = [None] * len(segments)
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {executor.submit(_generate_one_audio, session_id, i, seg, counters, lock): i
                    for i, seg in enumerate(segments)}
         for future in as_completed(futures):
@@ -754,8 +580,7 @@ def generate_audio(session_id: str, session_data: dict,
 
 def repair_audio_files(session_id: str) -> dict:
     """
-    Scan all 10 audio files for a session. Any file that fails the speech
-    check is regenerated via Gemini TTS.
+    Regenerate any missing audio files for a session via edge-tts.
     Returns {"repaired": [indices], "ok": [indices], "failed": [indices]}
     """
     session_data = load_session(session_id)
@@ -770,44 +595,44 @@ def repair_audio_files(session_id: str) -> dict:
 
     for i in range(10):
         ap = os.path.join(sdir, f"audio_{i:02d}.wav")
-        if not os.path.exists(ap):
-            bad_indices.append(i)
-            continue
-        ok, reason = audio_file_has_speech(ap)
-        if ok:
+        if os.path.exists(ap) and _wav_duration(ap) >= MIN_AUDIO_DURATION:
             ok_indices.append(i)
         else:
-            logger.warning("[%s] Audio %02d needs repair: %s", session_id, i, reason)
             bad_indices.append(i)
 
     if not bad_indices:
         logger.info("[%s] Audio repair: all %d files OK", session_id, len(ok_indices))
         return {"repaired": [], "ok": ok_indices, "failed": []}
 
-    logger.info("[%s] Audio repair: %d bad files to regenerate: %s",
+    logger.info("[%s] Audio repair: %d files to regenerate: %s",
                 session_id, len(bad_indices), bad_indices)
 
     repaired = []
     failed   = []
 
     def _repair_one(i: int):
-        ap   = os.path.join(sdir, f"audio_{i:02d}.wav")
-        text = segments[i]["text"].strip() if i < len(segments) else ""
+        ap      = os.path.join(sdir, f"audio_{i:02d}.wav")
+        mp3_path = ap.replace(".wav", ".mp3")
+        text    = segments[i]["text"].strip() if i < len(segments) else ""
         if not text:
             _write_silent_wav(ap, 7.5)
             failed.append(i)
             return
         try:
-            wav = _generate_gemini_tts(text, max_retries=7)
-            with open(ap, "wb") as f:
-                f.write(wav)
+            asyncio.run(_edge_tts_to_mp3(text, mp3_path))
+            _run_ff([_ffmpeg(), "-y", "-i", mp3_path,
+                     "-ar", "24000", "-ac", "1", ap], timeout=60)
+            try:
+                os.remove(mp3_path)
+            except OSError:
+                pass
             repaired.append(i)
             logger.info("[%s] Audio %02d repaired OK", session_id, i)
         except Exception as e:
             logger.error("[%s] Audio %02d repair failed: %s", session_id, i, e)
             failed.append(i)
 
-    with ThreadPoolExecutor(max_workers=5) as pool:
+    with ThreadPoolExecutor(max_workers=3) as pool:
         list(pool.map(_repair_one, bad_indices))
 
     return {"repaired": sorted(repaired), "ok": sorted(ok_indices), "failed": sorted(failed)}
