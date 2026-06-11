@@ -10,7 +10,7 @@ const isBuild  = process.argv.includes("build");
 const rawPort  = process.env.PORT;
 const basePath = process.env.BASE_PATH || "/";
 
-const port = isBuild ? 8081 : Number(rawPort || "8081");
+const port = isBuild ? 18130 : Number(rawPort || "18130");
 
 if (!isBuild && (Number.isNaN(port) || port <= 0)) {
   throw new Error(`Invalid PORT value: "${rawPort}"`);
@@ -55,6 +55,12 @@ export default defineConfig({
     allowedHosts: true,
     fs: {
       strict: true,
+    },
+    proxy: {
+      "/api": {
+        target: "http://127.0.0.1:8080",
+        changeOrigin: true,
+      },
     },
   },
   preview: {
