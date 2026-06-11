@@ -1,27 +1,18 @@
 """
 V-CTRL — Video generation pipeline
   Phase 1 : fetch news / custom topic → 10-segment DOCUMENTARY script + 20 image prompts
-  Phase 2 : images (chained sequential) + audio (parallel, validated, retry) run SIMULTANEOUSLY
-  Phase 3 : pure ffmpeg assembly — Ken Burns, burned subtitles via PIL
+  Phase 2 : three parallel threads start simultaneously:
+              • Thread A (External API) : images 0-12, sequential + chained
+              • Thread B (Gemini Flash) : images 13-19, parallel image generation
+              • Thread C (Gemini TTS)  : audio 0-9, parallel
+  Phase 3 : pure ffmpeg assembly — Ken Burns + subtitle baking via PIL
 
-Narrative style: journalistic documentary (Al Jazeera / Vice News), NOT character-movement fiction.
-Image prompts: every prompt explicitly places THE CHARACTER from the reference photo in the scene.
-Audio: WAV duration validated after each TTS call; re-generated if empty/silent.
+Auto-resume: on startup, any session with status "generating"/"assembling"/"pending"
+that has a saved character_image_path and a stale heartbeat gets restarted automatically.
 """
 
-import io
-import os
-import json
-import uuid
-import wave
-import base64
-import array
-import shutil
-import logging
-import subprocess
-import threading
-import time
-import re
+import io, os, json, uuid, wave, base64, array, shutil
+import logging, subprocess, threading, time, re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -34,22 +25,15 @@ logger = logging.getLogger(__name__)
 # Paths & constants
 # ---------------------------------------------------------------------------
 
-# In development: data/sessions/ at the workspace root (persistent).
-# In production: /tmp/sessions/ (writable, but ephemeral — resets on restart).
-# Override with SESSIONS_DIR env var if needed.
 _default_sessions_dir = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "data", "sessions",
 )
 SESSIONS_DIR = os.environ.get("SESSIONS_DIR", _default_sessions_dir)
-# Fallback to /tmp if the default path is not writable (e.g. production container)
 try:
     os.makedirs(SESSIONS_DIR, exist_ok=True)
-    # quick write test
-    _test = os.path.join(SESSIONS_DIR, ".write_test")
-    with open(_test, "w") as _f:
-        _f.write("ok")
-    os.remove(_test)
+    _t = os.path.join(SESSIONS_DIR, ".write_test")
+    open(_t, "w").write("ok"); os.remove(_t)
 except OSError:
     SESSIONS_DIR = "/tmp/v_ctrl_sessions"
     os.makedirs(SESSIONS_DIR, exist_ok=True)
@@ -59,7 +43,13 @@ IMAGE_EDIT_URL = "https://gem-tw6a.onrender.com/edit"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 VIDEO_W, VIDEO_H = 1280, 720
-FPS              = 24
+FPS = 24
+
+# Images 0-12  → External chained API (first 13)
+EXTERNAL_IMG_COUNT = 13
+# Images 13-19 → Gemini Flash image generation (last 7)
+GEMINI_IMG_COUNT   = 7
+TOTAL_IMGS         = EXTERNAL_IMG_COUNT + GEMINI_IMG_COUNT   # 20
 
 _status_lock = threading.Lock()
 
@@ -75,15 +65,11 @@ def _ffmpeg() -> str:
     except Exception:
         return "ffmpeg"
 
-
 def _run_ff(args: list, timeout: int = 180):
-    result = subprocess.run(args, capture_output=True, timeout=timeout)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"ffmpeg error (rc={result.returncode}):\n"
-            f"{result.stderr.decode(errors='replace')[-2000:]}"
-        )
-    return result
+    r = subprocess.run(args, capture_output=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffmpeg rc={r.returncode}:\n{r.stderr.decode(errors='replace')[-2000:]}")
+    return r
 
 
 # ---------------------------------------------------------------------------
@@ -91,61 +77,101 @@ def _run_ff(args: list, timeout: int = 180):
 # ---------------------------------------------------------------------------
 
 def session_dir(session_id: str) -> str:
-    path = os.path.join(SESSIONS_DIR, session_id)
-    os.makedirs(path, exist_ok=True)
-    return path
-
+    p = os.path.join(SESSIONS_DIR, session_id)
+    os.makedirs(p, exist_ok=True)
+    return p
 
 def load_session(session_id: str) -> dict | None:
-    path = os.path.join(SESSIONS_DIR, session_id, "data.json")
-    if not os.path.exists(path):
+    p = os.path.join(SESSIONS_DIR, session_id, "data.json")
+    if not os.path.exists(p):
         return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(p, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
 
-
 def save_session(session_id: str, data: dict):
-    path = os.path.join(SESSIONS_DIR, session_id, "data.json")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    p = os.path.join(SESSIONS_DIR, session_id, "data.json")
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-
 
 def list_sessions() -> list[dict]:
     sessions = []
     if not os.path.isdir(SESSIONS_DIR):
         return sessions
     for sid in os.listdir(SESSIONS_DIR):
-        data = load_session(sid)
-        if data:
+        d = load_session(sid)
+        if d:
             sessions.append({
                 "session_id":   sid,
-                "topic":        data.get("topic", ""),
-                "title":        data.get("title", ""),
-                "status":       data.get("status", "unknown"),
-                "progress":     data.get("progress", 0),
-                "current_step": data.get("current_step", ""),
-                "error":        data.get("error"),
-                "video_url":    f"/api/download/{sid}" if data.get("status") == "done" else None,
-                "created_at":   data.get("created_at", ""),
+                "topic":        d.get("topic", ""),
+                "title":        d.get("title", ""),
+                "status":       d.get("status", "unknown"),
+                "progress":     d.get("progress", 0),
+                "current_step": d.get("current_step", ""),
+                "error":        d.get("error"),
+                "video_url":    f"/api/download/{sid}" if d.get("status") == "done" else None,
+                "created_at":   d.get("created_at", ""),
             })
     sessions.sort(key=lambda s: s.get("created_at", ""), reverse=True)
     return sessions
-
 
 def update_status(session_id: str, status: str, progress: int,
                   current_step: str, error: str | None = None, **extra):
     with _status_lock:
         data = load_session(session_id) or {}
-        data["status"]       = status
-        data["progress"]     = progress
-        data["current_step"] = current_step
-        data["error"]        = error
+        data["status"]          = status
+        data["progress"]        = progress
+        data["current_step"]    = current_step
+        data["error"]           = error
+        data["last_heartbeat"]  = time.time()   # always refresh heartbeat
         data.update(extra)
         save_session(session_id, data)
+
+
+# ---------------------------------------------------------------------------
+# Auto-resume stalled sessions on server start
+# ---------------------------------------------------------------------------
+
+def auto_resume_stalled_sessions():
+    """
+    Called once on Flask startup.
+    Any session that was left in 'generating'/'assembling'/'pending' state
+    with a saved character image and a heartbeat older than 5 minutes is restarted.
+    """
+    if not os.path.isdir(SESSIONS_DIR):
+        return
+    now = time.time()
+    for sid in os.listdir(SESSIONS_DIR):
+        try:
+            data = load_session(sid)
+            if not data:
+                continue
+            status = data.get("status")
+            if status not in ("generating", "assembling", "pending"):
+                continue
+            char_img = data.get("character_image_path")
+            if not char_img or not os.path.exists(char_img):
+                continue
+            hb = data.get("last_heartbeat", 0)
+            if now - hb < 300:                  # still has a live heartbeat
+                continue
+            logger.info("[auto-resume] Restarting stalled session %s (status=%s)", sid, status)
+            t = threading.Thread(target=run_production, args=(sid, char_img), daemon=True)
+            t.start()
+        except Exception as e:
+            logger.warning("[auto-resume] Error checking session %s: %s", sid, e)
+
+
+def find_character_image(session_id: str) -> str | None:
+    """Return the character image path saved in session data, or None."""
+    data = load_session(session_id)
+    if not data:
+        return None
+    p = data.get("character_image_path")
+    return p if p and os.path.exists(p) else None
 
 
 # ---------------------------------------------------------------------------
@@ -153,11 +179,9 @@ def update_status(session_id: str, status: str, progress: int,
 # ---------------------------------------------------------------------------
 
 def _call_text_api(message: str, timeout: int = 90) -> str:
-    resp = requests.get(
-        TEXT_API_URL,
-        params={"message": message, "model": "default"},
-        timeout=timeout,
-    )
+    resp = requests.get(TEXT_API_URL,
+                        params={"message": message, "model": "default"},
+                        timeout=timeout)
     resp.raise_for_status()
     data = resp.json()
     if isinstance(data, dict):
@@ -167,7 +191,6 @@ def _call_text_api(message: str, timeout: int = 90) -> str:
                 return val.strip()
         return " ".join(v for v in data.values() if isinstance(v, str))
     return str(data).strip()
-
 
 def _extract_json(text: str) -> dict:
     text = text.strip()
@@ -187,168 +210,84 @@ def _extract_json(text: str) -> dict:
         return json.loads(m.group())
     raise ValueError(f"No JSON found: {text[:200]}")
 
+_NARRATIVE_PROMPT_TEMPLATE = """Tu es le narrateur d'un documentaire journalistique (style Al Jazeera / Vice News / France 24).
+Tu écris en français un récit en 10 segments pour une vidéo virale sur : "{topic}"
 
-# ─── THE SINGLE MOST IMPORTANT PROMPT ────────────────────────────────────────
-# Style cible : documentaire journalistique (Al Jazeera, Vice, France 24).
-# Raconter des FAITS, des CONTEXTES, des ÉVÉNEMENTS — jamais les états d'âme
-# ni les gestes physiques de personnages fictifs.
-# ─────────────────────────────────────────────────────────────────────────────
+═══ RÈGLE ABSOLUE — STYLE DOCUMENTAIRE ═══
+• Chaque segment = FAITS, ÉVÉNEMENTS, CONTEXTE HISTORIQUE, CITATIONS de personnes impliquées
+• INTERDIT : décrire les gestes, mouvements ou sensations physiques d'un personnage fictif
+• INTERDIT : "elle ouvre les yeux", "il respire profondément", "son cœur bat"
+• OBLIGATOIRE : "Un mouvement prend de l'ampleur", citations directes, enjeux géopolitiques/sociaux
+• Chaque segment = 30 à 45 mots, assez long pour une narration audio fluide
 
-_NARRATIVE_SYSTEM = """Tu es le narrateur d'un documentaire journalistique de haut niveau (style Al Jazeera / Vice News / France 24).
-Tu écris en français, sur un sujet donné, un récit en 10 segments pour une vidéo narrative virale.
+═══ EXEMPLE PARFAIT ═══
+"Depuis quelque temps, un mouvement inédit prend de l'ampleur. À la suite du vote d'une loi historique accordant la nationalité béninoise aux afro-descendants, des milliers de personnes venues d'Haïti et des Caraïbes font le voyage pour renouer avec leurs racines."
+"L'un des témoignages les plus poignants : 'Aujourd'hui, je franchis la porte, mais de mon plein gré. Volontairement. Je ne suis pas enchaînée, je n'ai pas été séparée de ma famille.'"
 
-═══════════════════════════════════════════
-RÈGLE N°1 — STYLE DOCUMENTAIRE UNIQUEMENT
-═══════════════════════════════════════════
-Chaque segment doit décrire :
-  • Des FAITS concrets, des ÉVÉNEMENTS réels ou plausibles
-  • Des CONTEXTES historiques, géopolitiques, sociaux
-  • Des CITATIONS de personnes impliquées (inventées mais crédibles)
-  • Des CONSÉQUENCES, des ENJEUX, des RETOURNEMENTS de situation
+═══ RÈGLE PROMPTS IMAGE ═══
+Chaque prompt DOIT :
+1. Mentionner "the person from the reference photo" pour que le personnage apparaisse
+2. Décrire exactement le LIEU et le DÉCOR correspondant aux paroles du segment
+3. Être très différent des autres (type de plan, lumière, décor différents)
+Types : WIDE SHOT | CLOSE-UP | EXTREME CLOSE-UP | AERIAL VIEW | LOW ANGLE | SILHOUETTE | DUTCH ANGLE | OVER-THE-SHOULDER | MEDIUM SHOT | TWO-SHOT
 
-═══════════════════════════════════════════
-RÈGLE N°2 — CE QUI EST STRICTEMENT INTERDIT
-═══════════════════════════════════════════
-❌ Décrire les gestes, mouvements ou sensations physiques d'un personnage fictif
-   Mauvais : "Elle ouvre les yeux. Ses mains tremblent. Il respire profondément."
-❌ Narrer des états d'âme internes ("il se sent", "elle ressent", "son cœur bat")
-❌ Raconter comme un roman ("il se leva et marcha vers la fenêtre")
-❌ Statistiques froides sans contexte humain
-❌ Bullet points, listes, titres
-
-═══════════════════════════════════════════
-EXEMPLE PARFAIT À IMITER
-═══════════════════════════════════════════
-"Depuis quelque temps, un mouvement inédit et profondément émouvant prend de l'ampleur. À la suite du vote d'une loi historique permettant d'accorder la nationalité béninoise aux afro-descendants, de nombreuses personnes venues d'Haïti, des Caraïbes et des Amériques font le voyage pour renouer avec leurs racines."
-
-"L'un des récits les plus poignants est celui de ces visiteurs qui se retrouvent face à la célèbre Porte du Non-Retour à Ouidah. Historiquement, ce monument commémore la tragédie de plus d'un million de personnes arrachées à leur terre et à leur culture."
-
-"Aujourd'hui, l'histoire s'inverse. Une jeune femme venue déposer sa demande de nationalité a récemment témoigné de ce bouleversement en traversant ce lieu de mémoire : 'Aujourd'hui, je franchis la porte, mais de mon plein gré. Volontairement. Je ne suis pas enchaînée.'"
-
-═══════════════════════════════════════════
-RÈGLE N°3 — PROMPTS IMAGE (TRÈS IMPORTANT)
-═══════════════════════════════════════════
-Chaque prompt image DOIT :
-1. Commencer par le TYPE DE PLAN en majuscules
-2. Mentionner explicitement "the person from the reference photo" pour que le personnage apparaisse
-3. Décrire précisément le LIEU, le DÉCOR et la LUMIÈRE qui CORRESPONDENT aux paroles du segment
-4. Varier FORTEMENT chaque prompt (pas deux fois le même type de plan ou décor)
-
-TYPES DE PLANS À UTILISER (chaque prompt = un type différent) :
-WIDE ESTABLISHING SHOT | CLOSE-UP PORTRAIT | EXTREME CLOSE-UP | AERIAL VIEW |
-LOW ANGLE SHOT | OVER-THE-SHOULDER | SILHOUETTE SHOT | DUTCH ANGLE |
-MEDIUM SHOT | TRACKING SHOT | POV SHOT | TWO-SHOT
-
-EXEMPLES DE BONS PROMPTS IMAGE :
-• "WIDE ESTABLISHING SHOT - the person from the reference photo standing before the Door of No Return in Ouidah Benin at sunset, fog rolling from the ocean, documentary photography, photorealistic, 8k, cinematic"
-• "EXTREME CLOSE-UP - the person from the reference photo's hands holding official citizenship documents, warm golden light, depth of field, photorealistic, 8k, cinematic"
-• "AERIAL VIEW - a coastal West African port town at dawn, crowded pier with hundreds of people arriving by boat, photorealistic, 8k, cinematic"
-
-═══════════════════════════════════════════
-FORMAT DE SORTIE — JSON STRICT
-═══════════════════════════════════════════
-Réponds UNIQUEMENT avec ce JSON, sans markdown, sans commentaires :
-{
-  "title": "Titre court et accrocheur (60 chars max)",
-  "description": "Résumé factuel et émouvant en 2 phrases",
-  "hashtags": ["#tag1","#tag2","#tag3","#tag4","#tag5"],
-  "segments": [
-    {
-      "index": 0,
-      "text": "Premier segment documentaire (30-45 mots). Accroche factuelle qui plante le contexte.",
-      "image_prompts": [
-        "TYPE DE PLAN - the person from the reference photo [action] in [lieu précis correspondant au texte], [lumière], photorealistic, 8k, cinematic",
-        "AUTRE TYPE DE PLAN - the person from the reference photo [action différente] in [autre décor lié au texte], [autre lumière], photorealistic, 8k, cinematic"
-      ]
-    }
-  ]
-}
-Les 10 segments doivent former un arc narratif complet : contexte → développement → tension → climax → resolution."""
-
-
-def _build_script_prompt(topic: str) -> str:
-    return f"""{_NARRATIVE_SYSTEM}
-
-SUJET : "{topic}"
-
-Génère maintenant les 10 segments documentaires sur ce sujet.
-Chaque "text" doit être entre 30 et 45 mots — assez long pour une narration audio fluide.
-Les image_prompts doivent correspondre exactement au lieu et au contexte décrit dans le texte.
-JSON uniquement, pas de markdown."""
-
+FORMAT JSON STRICT (sans markdown, sans commentaires) :
+{{"title":"...","description":"...","hashtags":["#...","#...","#...","#...","#..."],"segments":[{{"index":0,"text":"...30-45 mots...","image_prompts":["TYPE - the person from the reference photo [action liée au texte] in [décor précis du texte], [lumière], photorealistic, 8k, cinematic","TYPE - the person from the reference photo [autre action] in [autre décor lié au texte], [autre lumière], photorealistic, 8k, cinematic"]}},{{"index":1,...}},{{"index":2,...}},{{"index":3,...}},{{"index":4,...}},{{"index":5,...}},{{"index":6,...}},{{"index":7,...}},{{"index":8,...}},{{"index":9,"text":"...chute émotionnelle ou espoir...","image_prompts":["...","..."]}}]}}"""
 
 def _fallback_script(topic: str) -> dict:
     t = topic[:60]
     return {
-        "title":       f"Reportage : {t}",
-        "description": f"Un documentaire sur {t} et ses enjeux humains.",
-        "hashtags":    ["#reportage", "#documentaire", "#info", "#actualité", "#viral"],
-        "segments": [
-            {
-                "index": i,
-                "text":  f"Segment {i+1} — Au cœur de cette actualité mondiale, les faits révèlent une réalité complexe et profondément humaine qui touche des millions de personnes à travers le monde.",
-                "image_prompts": [
-                    f"WIDE ESTABLISHING SHOT - the person from the reference photo in a dramatic scene related to {t}, golden hour, photorealistic, 8k, cinematic",
-                    f"CLOSE-UP PORTRAIT - the person from the reference photo facing camera in context of {t}, dramatic lighting, photorealistic, 8k, cinematic",
-                ]
-            }
-            for i in range(10)
-        ],
+        "title": f"Reportage : {t}", "description": f"Un documentaire sur {t}.",
+        "hashtags": ["#reportage", "#documentaire", "#info", "#actualité", "#viral"],
+        "segments": [{"index": i, "text": f"Au cœur de cette réalité mondiale, des milliers de personnes témoignent d'une transformation profonde qui touche directement leur quotidien et l'avenir de leurs communautés : {topic[:30]}.",
+            "image_prompts": [
+                f"WIDE SHOT - the person from the reference photo in a meaningful scene about {t}, golden hour, photorealistic, 8k, cinematic",
+                f"CLOSE-UP PORTRAIT - the person from the reference photo facing camera, dramatic context of {t}, candlelight, photorealistic, 8k, cinematic"
+            ]} for i in range(10)],
     }
-
 
 def fetch_news_and_generate_script(custom_topic: str | None = None) -> dict:
     session_id = str(uuid.uuid4())
 
-    # Step 1: Get topic
     if custom_topic and custom_topic.strip():
         topic = custom_topic.strip()
-        logger.info("Using custom topic: %s", topic)
     else:
         try:
-            topic_raw = _call_text_api(
+            raw = _call_text_api(
                 "Donne-moi en une phrase courte (max 15 mots) le fait d'actualité le plus marquant "
-                "et le plus humain d'aujourd'hui, en français. Uniquement la phrase, sans ponctuation finale.",
-                timeout=30,
-            )
-            topic = topic_raw.strip().strip('"').strip("'").rstrip(".")
+                "et humain d'aujourd'hui, en français. Uniquement la phrase, sans ponctuation finale.", 30)
+            topic = raw.strip().strip('"\'').rstrip(".")
         except Exception as e:
             logger.warning("News fetch failed: %s", e)
             topic = "Le réchauffement climatique force des communautés entières à quitter leurs terres ancestrales"
 
-    # Step 2: Generate narrative documentary script
     for attempt in range(3):
         try:
-            raw  = _call_text_api(_build_script_prompt(topic), timeout=120)
+            raw  = _call_text_api(_NARRATIVE_PROMPT_TEMPLATE.format(topic=topic), 120)
             data = _extract_json(raw)
             if data.get("segments") and len(data["segments"]) >= 5:
                 break
         except Exception as e:
-            logger.warning("Script attempt %d failed: %s", attempt + 1, e)
+            logger.warning("Script attempt %d: %s", attempt + 1, e)
             data = {}
     else:
         data = _fallback_script(topic)
 
-    # Validate & pad to exactly 10 segments
     segments = data.get("segments", [])
     while len(segments) < 10:
         i = len(segments)
-        segments.append({
-            "index": i,
-            "text":  f"Ce phénomène mondial, qui touche des millions de personnes, révèle les enjeux profonds d'une réalité que peu osent aborder : {topic[:50]}.",
+        segments.append({"index": i,
+            "text": f"Ce phénomène mondial révèle les enjeux profonds d'une réalité que peu osent aborder et qui touche directement des millions de personnes à travers le monde : {topic[:40]}.",
             "image_prompts": [
-                f"MEDIUM SHOT - the person from the reference photo in a meaningful location related to {topic[:40]}, warm natural light, photorealistic, 8k, cinematic",
-                f"DUTCH ANGLE - the person from the reference photo in a dramatic context of {topic[:40]}, blue hour, photorealistic, 8k, cinematic",
-            ],
-        })
+                f"MEDIUM SHOT - the person from the reference photo in a key scene about {topic[:35]}, warm light, photorealistic, 8k, cinematic",
+                f"DUTCH ANGLE - the person from the reference photo in dramatic context of {topic[:35]}, blue hour, photorealistic, 8k, cinematic"
+            ]})
     segments = segments[:10]
     for i, seg in enumerate(segments):
         seg["index"] = i
         prompts = seg.get("image_prompts", [])
         while len(prompts) < 2:
-            prompts.append(
-                f"WIDE SHOT - the person from the reference photo in a scene about {topic[:40]}, photorealistic, 8k, cinematic"
-            )
+            prompts.append(f"WIDE SHOT - the person from the reference photo related to {topic[:35]}, photorealistic, 8k, cinematic")
         seg["image_prompts"] = prompts[:2]
 
     import datetime
@@ -356,15 +295,16 @@ def fetch_news_and_generate_script(custom_topic: str | None = None) -> dict:
         "session_id":   session_id,
         "created_at":   datetime.datetime.utcnow().isoformat(),
         "topic":        topic,
-        "title":        data.get("title",       f"Reportage : {topic}")[:80],
+        "title":        data.get("title", f"Reportage : {topic}")[:80],
         "description":  data.get("description", "Un documentaire sur l'actualité du monde.")[:200],
-        "hashtags":     data.get("hashtags",    ["#reportage", "#documentaire", "#info", "#actualité", "#viral"])[:5],
+        "hashtags":     data.get("hashtags", ["#reportage","#documentaire","#info","#actualité","#viral"])[:5],
         "segments":     segments,
         "status":       "pending",
         "progress":     0,
         "current_step": "Script généré — en attente de l'image du personnage.",
         "images_done":  [],
         "audio_done":   [],
+        "last_heartbeat": 0,
         "error":        None,
     }
     save_session(session_id, result)
@@ -372,7 +312,7 @@ def fetch_news_and_generate_script(custom_topic: str | None = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2a — Image generation (sequential, chained for character consistency)
+# Shared helpers
 # ---------------------------------------------------------------------------
 
 def _encode_b64(path: str) -> str:
@@ -380,28 +320,26 @@ def _encode_b64(path: str) -> str:
         return base64.b64encode(f.read()).decode()
 
 
-def generate_images(session_id: str, character_image_path: str,
-                    session_data: dict, counters: dict, lock: threading.Lock) -> list[str]:
-    segments    = session_data["segments"]
-    all_prompts = [p for seg in segments for p in seg["image_prompts"]]
-    image_paths = []
-    prev_path   = character_image_path
+# ---------------------------------------------------------------------------
+# Phase 2a-A — External API: images 0 to EXTERNAL_IMG_COUNT-1 (sequential, chained)
+# ---------------------------------------------------------------------------
 
-    for i, prompt in enumerate(all_prompts):
-        with lock:
-            counters["img"] = i + 1
-        pct = 5 + int((i / 20) * 35)
+def generate_images_external(session_id: str, character_image_path: str,
+                              all_prompts: list[str], counters: dict,
+                              lock: threading.Lock, image_paths: list) -> None:
+    """Generates images 0..12 using the chained external API."""
+    prev_path = character_image_path
 
+    for i in range(EXTERNAL_IMG_COUNT):
+        prompt   = all_prompts[i]
         img_path = os.path.join(session_dir(session_id), f"image_{i:02d}.jpg")
         success  = False
 
         for attempt in range(3):
             try:
-                resp = requests.post(
-                    IMAGE_EDIT_URL,
+                resp = requests.post(IMAGE_EDIT_URL,
                     json={"prompt": prompt, "image": _encode_b64(prev_path)},
-                    timeout=120,
-                )
+                    timeout=120)
                 resp.raise_for_status()
                 ct = resp.headers.get("content-type", "")
                 if "image" in ct:
@@ -412,241 +350,253 @@ def generate_images(session_id: str, character_image_path: str,
                     if isinstance(b64, str) and b64.startswith("data:"):
                         b64 = b64.split(",", 1)[1]
                     raw = base64.b64decode(b64)
-
                 if len(raw) < 5000:
                     raise ValueError(f"Image too small ({len(raw)} bytes)")
-
                 with open(img_path, "wb") as f:
                     f.write(raw)
                 prev_path = img_path
                 success   = True
-                logger.info("[%s] Image %d/20 OK (attempt %d)", session_id, i + 1, attempt + 1)
+                logger.info("[%s] Ext-image %d/13 OK (attempt %d)", session_id, i + 1, attempt + 1)
                 break
             except Exception as e:
-                logger.warning("[%s] Image %d attempt %d failed: %s", session_id, i + 1, attempt + 1, e)
+                logger.warning("[%s] Ext-image %d attempt %d: %s", session_id, i + 1, attempt + 1, e)
                 if attempt < 2:
                     time.sleep(2 ** attempt)
 
         if not success:
-            logger.error("[%s] Image %d: all attempts failed, copying previous", session_id, i + 1)
+            logger.error("[%s] Ext-image %d failed — copying previous", session_id, i + 1)
             shutil.copy(prev_path, img_path)
 
-        image_paths.append(img_path)
+        with lock:
+            image_paths[i] = img_path
+            counters["img"] = counters.get("img", 0) + 1
 
         with _status_lock:
             data = load_session(session_id) or {}
             done = data.get("images_done", [])
             if i not in done:
                 done.append(i)
-            data["images_done"]  = done
-            data["status"]       = "generating"
-            data["progress"]     = pct
-            data["current_step"] = f"Images {i+1}/20 • Audio {counters.get('aud', 0)}/10 en parallèle..."
+            data["images_done"]     = done
+            data["last_heartbeat"]  = time.time()
+            data["status"]          = "generating"
+            data["progress"]        = 5 + int((counters.get("img", 0) / TOTAL_IMGS) * 35)
+            data["current_step"]    = f"Images ext. {i+1}/13 • Gemini {counters.get('gimg',0)}/7 • Audio {counters.get('aud',0)}/10"
             save_session(session_id, data)
 
-    return image_paths
-
 
 # ---------------------------------------------------------------------------
-# Phase 2b — Audio generation (parallel, validated, retry until real speech)
+# Phase 2a-B — Gemini Flash image generation: images 13 to 19 (parallel)
 # ---------------------------------------------------------------------------
 
-def _pcm_to_wav(pcm_data: bytes, sample_rate: int = 24000,
-                channels: int = 1, sample_width: int = 2) -> bytes:
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(channels)
-        wf.setsampwidth(sample_width)
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm_data)
-    return buf.getvalue()
-
-
-def _wav_duration(path: str) -> float:
-    """Return duration in seconds, or 0 if file is invalid."""
-    try:
-        with wave.open(path, "r") as wf:
-            frames = wf.getnframes()
-            rate   = wf.getframerate()
-            if rate == 0:
-                return 0.0
-            return frames / rate
-    except Exception:
-        return 0.0
-
-
-def _wav_is_silent(path: str, threshold: float = 50.0) -> bool:
-    """Return True if the WAV file is essentially silent (RMS below threshold)."""
-    try:
-        with wave.open(path, "r") as wf:
-            frames = wf.readframes(wf.getnframes())
-            sw = wf.getsampwidth()
-        if sw == 2:
-            samples = array.array("h", frames)
-        else:
-            return False
-        if not samples:
-            return True
-        rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
-        return rms < threshold
-    except Exception:
-        return True
-
-
-def _generate_gemini_tts(text: str, max_retries: int = 5) -> bytes:
-    """
-    Call Gemini TTS with exponential-backoff retry.
-    Validates that the returned WAV contains real speech (not silence, not empty).
-    Returns valid WAV bytes.
-    """
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY not set")
-
-    clean_text = text.strip()
-    if not clean_text:
-        raise ValueError("Empty text passed to TTS")
-
-    logger.info("[TTS] Generating audio for: %s...", clean_text[:60])
-
+def _generate_one_gemini_image(prompt: str, reference_path: str,
+                                max_retries: int = 3) -> bytes:
+    """Call Gemini 2.0 Flash image generation with the character image as context."""
     url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-           "gemini-2.5-flash-preview-tts:generateContent")
+           "gemini-2.0-flash-preview-image-generation:generateContent")
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    b64_ref = _encode_b64(reference_path)
     payload = {
-        "contents": [{"parts": [{"text": clean_text}]}],
-        "generationConfig": {
-            "responseModalities": ["AUDIO"],
-            "speechConfig": {"voiceConfig": {
-                "prebuiltVoiceConfig": {"voiceName": "Kore"}
-            }},
-        },
+        "contents": [{
+            "parts": [
+                {"inlineData": {"mimeType": "image/jpeg", "data": b64_ref}},
+                {"text": f"Using the person from the reference photo, generate: {prompt}"},
+            ]
+        }],
+        "generationConfig": {"responseModalities": ["IMAGE"]},
     }
 
     last_err = None
     for attempt in range(max_retries):
         try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=90)
+            resp = requests.post(url, headers=headers, json=payload, timeout=120)
             resp.raise_for_status()
-
             data = resp.json()
-
-            # Navigate Gemini response structure
-            candidates = data.get("candidates", [])
-            if not candidates:
-                raise ValueError("No candidates in TTS response")
-
-            parts = candidates[0].get("content", {}).get("parts", [])
-            if not parts:
-                raise ValueError("No parts in TTS response")
-
-            inline = parts[0].get("inlineData", {})
-            b64    = inline.get("data", "")
-            if not b64:
-                raise ValueError("No audio data in TTS response")
-
-            raw = base64.b64decode(b64)
-            if len(raw) < 1000:
-                raise ValueError(f"Audio data too small ({len(raw)} bytes)")
-
-            # Gemini TTS returns raw PCM — wrap in WAV if needed
-            if raw[:4] != b"RIFF":
-                wav = _pcm_to_wav(raw, sample_rate=24000, channels=1, sample_width=2)
-            else:
-                wav = raw
-
-            # Validate duration
-            buf = io.BytesIO(wav)
-            try:
-                with wave.open(buf, "r") as wf:
-                    dur = wf.getnframes() / wf.getframerate()
-            except Exception as e:
-                raise ValueError(f"Invalid WAV: {e}")
-
-            if dur < 0.5:
-                raise ValueError(f"Audio too short: {dur:.2f}s")
-
-            logger.info("[TTS] OK (attempt %d) — duration %.2fs for: %s...",
-                        attempt + 1, dur, clean_text[:40])
-            return wav
-
+            parts = data["candidates"][0]["content"]["parts"]
+            for part in parts:
+                if "inlineData" in part:
+                    raw = base64.b64decode(part["inlineData"]["data"])
+                    if len(raw) < 5000:
+                        raise ValueError(f"Gemini image too small ({len(raw)} bytes)")
+                    return raw
+            raise ValueError("No image part in Gemini response")
         except Exception as e:
             last_err = e
-            wait = min(2 ** attempt, 30)
-            logger.warning("[TTS] Attempt %d/%d failed: %s — retry in %ds",
+            wait = 2 ** attempt
+            logger.warning("[Gemini-img] Attempt %d/%d failed: %s — retry in %ds",
                            attempt + 1, max_retries, e, wait)
             if attempt < max_retries - 1:
                 time.sleep(wait)
 
+    raise RuntimeError(f"Gemini image gen failed after {max_retries} attempts: {last_err}")
+
+
+def generate_images_gemini(session_id: str, character_image_path: str,
+                            all_prompts: list[str], counters: dict,
+                            lock: threading.Lock, image_paths: list) -> None:
+    """
+    Generates images 13..19 using Gemini Flash image generation.
+    Each image uses the character reference photo as context.
+    Runs in parallel with the external API thread — both start simultaneously.
+    """
+    def _do_one(i: int) -> tuple[int, str]:
+        prompt   = all_prompts[i]
+        img_path = os.path.join(session_dir(session_id), f"image_{i:02d}.jpg")
+        try:
+            raw = _generate_one_gemini_image(prompt, character_image_path)
+            with open(img_path, "wb") as f:
+                f.write(raw)
+            logger.info("[%s] Gemini-image %d/7 OK", session_id, i - EXTERNAL_IMG_COUNT + 1)
+        except Exception as e:
+            logger.error("[%s] Gemini-image %d failed: %s — copying character", session_id, i, e)
+            shutil.copy(character_image_path, img_path)
+        return i, img_path
+
+    gemini_indices = list(range(EXTERNAL_IMG_COUNT, TOTAL_IMGS))  # 13-19
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(_do_one, i): i for i in gemini_indices}
+        for future in as_completed(futures):
+            i, img_path = future.result()
+            with lock:
+                image_paths[i] = img_path
+                counters["gimg"] = counters.get("gimg", 0) + 1
+
+            with _status_lock:
+                data = load_session(session_id) or {}
+                done = data.get("images_done", [])
+                if i not in done:
+                    done.append(i)
+                data["images_done"]     = done
+                data["last_heartbeat"]  = time.time()
+                data["current_step"]    = f"Images ext. {counters.get('img',0)}/13 • Gemini {counters.get('gimg',0)}/7 • Audio {counters.get('aud',0)}/10"
+                save_session(session_id, data)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2b — Audio: Gemini TTS (parallel, validated, with retry)
+# ---------------------------------------------------------------------------
+
+def _pcm_to_wav(pcm: bytes, rate: int = 24000, ch: int = 1, sw: int = 2) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(ch); wf.setsampwidth(sw); wf.setframerate(rate)
+        wf.writeframes(pcm)
+    return buf.getvalue()
+
+def _wav_duration(path: str) -> float:
+    try:
+        with wave.open(path, "r") as wf:
+            return wf.getnframes() / (wf.getframerate() or 1)
+    except Exception:
+        return 0.0
+
+def _wav_is_silent(path: str, threshold: float = 50.0) -> bool:
+    try:
+        with wave.open(path, "r") as wf:
+            frames = wf.readframes(wf.getnframes())
+            sw = wf.getsampwidth()
+        if sw != 2:
+            return False
+        samples = array.array("h", frames)
+        if not samples:
+            return True
+        return (sum(s*s for s in samples) / len(samples)) ** 0.5 < threshold
+    except Exception:
+        return True
+
+def _write_silent_wav(path: str, duration: float = 7.5, rate: int = 24000):
+    n = int(rate * duration)
+    with wave.open(path, "w") as wf:
+        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(rate)
+        wf.writeframes(array.array("h", [0] * n).tobytes())
+
+def _generate_gemini_tts(text: str, max_retries: int = 5) -> bytes:
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY not set")
+    clean = text.strip()
+    if not clean:
+        raise ValueError("Empty text")
+
+    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+           "gemini-2.5-flash-preview-tts:generateContent")
+    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    payload = {
+        "contents": [{"parts": [{"text": clean}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Kore"}}},
+        },
+    }
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=90)
+            resp.raise_for_status()
+            data = resp.json()
+            b64  = data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
+            if not b64:
+                raise ValueError("Empty audio data")
+            raw = base64.b64decode(b64)
+            if len(raw) < 1000:
+                raise ValueError(f"Audio too small ({len(raw)} bytes)")
+            wav = raw if raw[:4] == b"RIFF" else _pcm_to_wav(raw)
+            buf = io.BytesIO(wav)
+            with wave.open(buf, "r") as wf:
+                dur = wf.getnframes() / wf.getframerate()
+            if dur < 0.5:
+                raise ValueError(f"Audio too short ({dur:.2f}s)")
+            logger.info("[TTS] OK attempt=%d dur=%.2fs text=%s...", attempt+1, dur, clean[:40])
+            return wav
+        except Exception as e:
+            last_err = e
+            wait = min(2 ** attempt, 30)
+            logger.warning("[TTS] attempt %d/%d failed: %s — retry in %ds", attempt+1, max_retries, e, wait)
+            if attempt < max_retries - 1:
+                time.sleep(wait)
     raise RuntimeError(f"TTS failed after {max_retries} attempts: {last_err}")
 
-
-def _write_silent_wav(path: str, duration: float = 7.5, sample_rate: int = 24000):
-    num_frames = int(sample_rate * duration)
-    with wave.open(path, "w") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(array.array("h", [0] * num_frames).tobytes())
-
-
 def _generate_one_audio(session_id: str, i: int, seg: dict,
-                        counters: dict, lock: threading.Lock) -> str:
+                         counters: dict, lock: threading.Lock) -> str:
     audio_path = os.path.join(session_dir(session_id), f"audio_{i:02d}.wav")
-    text       = seg.get("text", "").strip()
-
+    text = seg.get("text", "").strip()
     if not text:
-        logger.error("[%s] Segment %d has empty text — writing silence", session_id, i)
-        _write_silent_wav(audio_path)
+        _write_silent_wav(audio_path); 
     else:
         try:
-            wav_bytes = _generate_gemini_tts(text)
+            wav = _generate_gemini_tts(text)
             with open(audio_path, "wb") as f:
-                f.write(wav_bytes)
-
-            dur = _wav_duration(audio_path)
-            logger.info("[%s] Audio %d/10 saved (%.2fs)", session_id, i + 1, dur)
-
-            # Extra safety: re-check silence
+                f.write(wav)
             if _wav_is_silent(audio_path):
-                logger.warning("[%s] Audio %d sounds silent — retrying once", session_id, i)
-                wav_bytes2 = _generate_gemini_tts(text, max_retries=3)
+                logger.warning("[%s] Audio %d silent — retrying", session_id, i)
+                wav = _generate_gemini_tts(text, max_retries=3)
                 with open(audio_path, "wb") as f:
-                    f.write(wav_bytes2)
-                dur = _wav_duration(audio_path)
-                logger.info("[%s] Audio %d re-generated (%.2fs)", session_id, i + 1, dur)
-
+                    f.write(wav)
         except Exception as e:
-            logger.error("[%s] Audio %d failed all retries: %s — writing silence", session_id, i + 1, e)
+            logger.error("[%s] Audio %d all retries failed: %s", session_id, i, e)
             _write_silent_wav(audio_path)
 
     with lock:
         counters["aud"] = counters.get("aud", 0) + 1
-
     with _status_lock:
         data = load_session(session_id) or {}
         done = data.get("audio_done", [])
         if i not in done:
             done.append(i)
-        data["audio_done"] = done
+        data["audio_done"]     = done
+        data["last_heartbeat"] = time.time()
         save_session(session_id, data)
-
     return audio_path
-
 
 def generate_audio(session_id: str, session_data: dict,
                    counters: dict, lock: threading.Lock) -> list[str]:
     segments    = session_data["segments"]
     audio_paths = [None] * len(segments)
-
-    # max_workers=2 avoids Gemini rate limits; segments run in parallel pairs
     with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = {
-            executor.submit(_generate_one_audio, session_id, i, seg, counters, lock): i
-            for i, seg in enumerate(segments)
-        }
+        futures = {executor.submit(_generate_one_audio, session_id, i, seg, counters, lock): i
+                   for i, seg in enumerate(segments)}
         for future in as_completed(futures):
-            i              = futures[future]
+            i = futures[future]
             audio_paths[i] = future.result()
-
     return audio_paths
 
 
@@ -654,7 +604,7 @@ def generate_audio(session_id: str, session_data: dict,
 # Phase 3 — Video assembly via pure ffmpeg
 # ---------------------------------------------------------------------------
 
-def _find_font(size: int = 34) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+def _find_font(size: int = 34):
     for c in [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
@@ -662,160 +612,111 @@ def _find_font(size: int = 34) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
         "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
     ]:
         if os.path.exists(c):
-            try:
-                return ImageFont.truetype(c, size)
-            except Exception:
-                pass
+            try: return ImageFont.truetype(c, size)
+            except Exception: pass
     return ImageFont.load_default()
 
-
-def _bake_subtitle_to_file(src_path: str, text: str, dst_path: str):
-    try:
-        img = PILImage.open(src_path).convert("RGB")
-    except Exception:
-        img = PILImage.new("RGB", (VIDEO_W, VIDEO_H), (20, 20, 20))
+def _bake_subtitle(src: str, text: str, dst: str):
+    try: img = PILImage.open(src).convert("RGB")
+    except Exception: img = PILImage.new("RGB", (VIDEO_W, VIDEO_H), (20,20,20))
     img  = img.resize((VIDEO_W, VIDEO_H), PILImage.LANCZOS)
     draw = ImageDraw.Draw(img)
     font = _find_font(34)
-
-    # Word-wrap to max 2 lines
     words = text.split()
     mid   = max(1, len(words) // 2)
     lines = [" ".join(words[:mid])]
-    if words[mid:]:
-        lines.append(" ".join(words[mid:]))
-
+    if words[mid:]: lines.append(" ".join(words[mid:]))
     y = VIDEO_H - 110
     for line in lines:
         try:
-            bbox = draw.textbbox((0, 0), line, font=font)
-            tw   = bbox[2] - bbox[0]
+            bbox = draw.textbbox((0,0), line, font=font)
+            tw = bbox[2] - bbox[0]
         except AttributeError:
             tw = len(line) * 18
         x = (VIDEO_W - tw) // 2
-        draw.rectangle([x - 8, y - 4, x + tw + 8, y + 40], fill=(0, 0, 0, 140))
-        draw.text((x + 2, y + 2), line, font=font, fill=(0, 0, 0, 255))
-        draw.text((x,     y    ), line, font=font, fill=(255, 255, 255, 255))
+        draw.rectangle([x-8, y-4, x+tw+8, y+40], fill=(0,0,0,140))
+        draw.text((x+2, y+2), line, font=font, fill=(0,0,0,255))
+        draw.text((x,   y  ), line, font=font, fill=(255,255,255,255))
         y += 46
-    img.save(dst_path, "JPEG", quality=90)
-
+    img.save(dst, "JPEG", quality=90)
 
 _KB_SCALE = f"{int(VIDEO_W*1.1)}:{int(VIDEO_H*1.1)}"
-_KB_DX    = VIDEO_W  * 1.1 - VIDEO_W
-_KB_DY    = VIDEO_H  * 1.1 - VIDEO_H
+_KB_DX    = VIDEO_W * 1.1 - VIDEO_W
+_KB_DY    = VIDEO_H * 1.1 - VIDEO_H
 
-
-def _ken_burns_vf(duration: float, direction: str = "fwd") -> str:
+def _kb_vf(dur: float, direction: str = "fwd") -> str:
     if direction == "fwd":
-        x_expr = f"'trunc({_KB_DX:.1f}*t/{duration:.4f})'"
-        y_expr = f"'trunc({_KB_DY:.1f}*t/{duration:.4f})'"
+        xe = f"'trunc({_KB_DX:.1f}*t/{dur:.4f})'"; ye = f"'trunc({_KB_DY:.1f}*t/{dur:.4f})'"
     else:
-        x_expr = f"'trunc({_KB_DX:.1f}*(1-t/{duration:.4f}))'"
-        y_expr = f"'trunc({_KB_DY:.1f}*(1-t/{duration:.4f}))'"
-    return (
-        f"scale={_KB_SCALE}:force_original_aspect_ratio=increase,"
-        f"crop={VIDEO_W}:{VIDEO_H}:{x_expr}:{y_expr},"
-        f"setsar=1"
-    )
-
+        xe = f"'trunc({_KB_DX:.1f}*(1-t/{dur:.4f}))'"; ye = f"'trunc({_KB_DY:.1f}*(1-t/{dur:.4f}))'"
+    return f"scale={_KB_SCALE}:force_original_aspect_ratio=increase,crop={VIDEO_W}:{VIDEO_H}:{xe}:{ye},setsar=1"
 
 def assemble_video(session_id: str, image_paths: list[str],
                    audio_paths: list[str], session_data: dict) -> str:
     ff   = _ffmpeg()
     sdir = session_dir(session_id)
     update_status(session_id, "assembling", 72, "Assemblage de la vidéo en cours...")
+    segments = session_data["segments"]
+    clips    = []
 
-    segments      = session_data["segments"]
-    segment_clips = []
+    for si, seg in enumerate(segments):
+        update_status(session_id, "assembling", 72 + int((si/10)*24),
+                      f"Rendu segment {si+1}/10...", last_heartbeat=time.time())
 
-    for seg_i, seg in enumerate(segments):
-        update_status(
-            session_id, "assembling",
-            72 + int((seg_i / 10) * 24),
-            f"Rendu segment {seg_i+1}/10...",
-        )
-
-        audio_path = audio_paths[seg_i] if seg_i < len(audio_paths) else None
-        if not audio_path or not os.path.exists(audio_path):
-            audio_path = os.path.join(sdir, f"audio_{seg_i:02d}.wav")
-            _write_silent_wav(audio_path)
-
-        audio_dur = _wav_duration(audio_path)
-        if audio_dur < 0.5:
-            logger.warning("[%s] Segment %d audio too short (%.2fs) — re-generating",
-                           session_id, seg_i, audio_dur)
+        ap = audio_paths[si] if si < len(audio_paths) else None
+        if not ap or not os.path.exists(ap):
+            ap = os.path.join(sdir, f"audio_{si:02d}.wav")
+            _write_silent_wav(ap)
+        dur = _wav_duration(ap)
+        if dur < 0.5:
             try:
                 wav = _generate_gemini_tts(seg["text"], max_retries=3)
-                with open(audio_path, "wb") as f:
-                    f.write(wav)
-                audio_dur = _wav_duration(audio_path)
-            except Exception as e:
-                logger.error("[%s] Re-gen failed: %s", session_id, e)
-                _write_silent_wav(audio_path, duration=7.0)
-                audio_dur = 7.0
+                with open(ap, "wb") as f: f.write(wav)
+                dur = _wav_duration(ap)
+            except Exception:
+                _write_silent_wav(ap, 7.0); dur = 7.0
 
-        img_dur = max(audio_dur / 2.0, 1.0)
+        img_dur = max(dur / 2.0, 1.0)
+        baked   = []
+        for off in range(2):
+            idx  = si * 2 + off
+            src  = image_paths[idx] if idx < len(image_paths) and image_paths[idx] else image_paths[-1]
+            dst  = os.path.join(sdir, f"sub_{idx:02d}.jpg")
+            _bake_subtitle(src, seg["text"], dst)
+            baked.append(dst)
 
-        baked = []
-        for offset in range(2):
-            img_idx  = seg_i * 2 + offset
-            src      = image_paths[img_idx] if img_idx < len(image_paths) else image_paths[-1]
-            baked_p  = os.path.join(sdir, f"sub_{img_idx:02d}.jpg")
-            _bake_subtitle_to_file(src, seg["text"], baked_p)
-            baked.append(baked_p)
-
-        direction      = "fwd" if seg_i % 2 == 0 else "rev"
-        vf0            = _ken_burns_vf(img_dur, direction)
-        vf1            = _ken_burns_vf(img_dur, "rev" if direction == "fwd" else "fwd")
-        seg_clip       = os.path.join(sdir, f"seg_{seg_i:02d}.mp4")
-        filter_complex = (
-            f"[0:v]{vf0}[v0];"
-            f"[1:v]{vf1}[v1];"
-            f"[v0][v1]concat=n=2:v=1:a=0[vout]"
-        )
-        cmd = [
-            ff, "-y",
-            "-loop", "1", "-t", f"{img_dur:.4f}", "-i", baked[0],
-            "-loop", "1", "-t", f"{img_dur:.4f}", "-i", baked[1],
-            "-i", audio_path,
-            "-filter_complex", filter_complex,
-            "-map", "[vout]", "-map", "2:a",
-            "-t", f"{audio_dur:.4f}",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-pix_fmt", "yuv420p", "-r", str(FPS),
-            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "1",
-            seg_clip,
-        ]
-        try:
-            _run_ff(cmd, timeout=180)
-            logger.info("[%s] Segment %d/10 assembled (audio %.2fs)", session_id, seg_i + 1, audio_dur)
-        except Exception as e:
-            logger.error("[%s] Segment %d assembly failed: %s", session_id, seg_i + 1, e)
-            raise
-
-        segment_clips.append(seg_clip)
+        d   = "fwd" if si % 2 == 0 else "rev"
+        vf0 = _kb_vf(img_dur, d)
+        vf1 = _kb_vf(img_dur, "rev" if d == "fwd" else "fwd")
+        clip = os.path.join(sdir, f"seg_{si:02d}.mp4")
+        filt = (f"[0:v]{vf0}[v0];[1:v]{vf1}[v1];[v0][v1]concat=n=2:v=1:a=0[vout]")
+        _run_ff([ff, "-y",
+            "-loop","1","-t",f"{img_dur:.4f}","-i",baked[0],
+            "-loop","1","-t",f"{img_dur:.4f}","-i",baked[1],
+            "-i",ap, "-filter_complex",filt,
+            "-map","[vout]","-map","2:a","-t",f"{dur:.4f}",
+            "-c:v","libx264","-preset","fast","-crf","23",
+            "-pix_fmt","yuv420p","-r",str(FPS),
+            "-c:a","aac","-b:a","128k","-ar","44100","-ac","1", clip
+        ], timeout=180)
+        clips.append(clip)
+        logger.info("[%s] Segment %d/10 assembled (audio %.2fs)", session_id, si+1, dur)
 
     concat_txt = os.path.join(sdir, "concat.txt")
     with open(concat_txt, "w") as f:
-        for clip in segment_clips:
-            f.write(f"file '{clip}'\n")
+        for c in clips: f.write(f"file '{c}'\n")
 
-    out_path = os.path.join(sdir, "final_video.mp4")
-    update_status(session_id, "assembling", 97, "Finalisation de la vidéo...")
-    _run_ff([
-        ff, "-y",
-        "-f", "concat", "-safe", "0", "-i", concat_txt,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k",
-        out_path,
-    ], timeout=300)
-
-    logger.info("[%s] Final video ready: %s", session_id, out_path)
-    return out_path
+    out = os.path.join(sdir, "final_video.mp4")
+    update_status(session_id, "assembling", 97, "Finalisation…")
+    _run_ff([ff,"-y","-f","concat","-safe","0","-i",concat_txt,
+             "-c:v","libx264","-preset","fast","-crf","23",
+             "-c:a","aac","-b:a","128k", out], timeout=300)
+    logger.info("[%s] Final video → %s", session_id, out)
+    return out
 
 
 # ---------------------------------------------------------------------------
-# Main production runner
+# Main production runner — 3 parallel threads
 # ---------------------------------------------------------------------------
 
 def run_production(session_id: str, character_image_path: str):
@@ -825,60 +726,82 @@ def run_production(session_id: str, character_image_path: str):
             logger.error("[%s] Session not found", session_id)
             return
 
-        lock     = threading.Lock()
-        counters = {"img": 0, "aud": 0}
+        # Save character image path for potential auto-resume later
+        with _status_lock:
+            data = load_session(session_id) or {}
+            data["character_image_path"] = character_image_path
+            save_session(session_id, data)
+
+        all_prompts = [p for seg in session_data["segments"] for p in seg["image_prompts"]]
+        # all_prompts[0..12]  → External API
+        # all_prompts[13..19] → Gemini Flash
+
+        lock         = threading.Lock()
+        counters     = {"img": 0, "gimg": 0, "aud": 0}
+        image_paths  = [None] * TOTAL_IMGS
 
         update_status(session_id, "generating", 5,
-                      "Génération images et audio en parallèle...",
+                      "3 threads démarrés : ext. images 0-12 • Gemini images 13-19 • audio TTS",
                       images_done=[], audio_done=[])
 
-        img_result   = {"paths": None, "error": None}
-        audio_result = {"paths": None, "error": None}
+        results = {"img_ext": None, "img_gem": None, "audio": None,
+                   "err_ext": None, "err_gem": None, "err_aud": None}
 
-        def run_images():
+        def run_ext():
             try:
-                img_result["paths"] = generate_images(
-                    session_id, character_image_path, session_data, counters, lock)
+                generate_images_external(session_id, character_image_path,
+                                         all_prompts, counters, lock, image_paths)
             except Exception as e:
-                img_result["error"] = e
-                logger.error("[%s] Image thread: %s", session_id, e, exc_info=True)
+                results["err_ext"] = e
+                logger.error("[%s] External-images thread: %s", session_id, e, exc_info=True)
 
-        def run_audio():
+        def run_gem():
             try:
-                audio_result["paths"] = generate_audio(
-                    session_id, session_data, counters, lock)
+                generate_images_gemini(session_id, character_image_path,
+                                       all_prompts, counters, lock, image_paths)
             except Exception as e:
-                audio_result["error"] = e
+                results["err_gem"] = e
+                logger.error("[%s] Gemini-images thread: %s", session_id, e, exc_info=True)
+
+        def run_aud():
+            try:
+                results["audio"] = generate_audio(session_id, session_data, counters, lock)
+            except Exception as e:
+                results["err_aud"] = e
                 logger.error("[%s] Audio thread: %s", session_id, e, exc_info=True)
 
-        t1 = threading.Thread(target=run_images, daemon=True)
-        t2 = threading.Thread(target=run_audio,  daemon=True)
-        t1.start(); t2.start()
-        t1.join();  t2.join()
+        t1 = threading.Thread(target=run_ext, daemon=True)
+        t2 = threading.Thread(target=run_gem, daemon=True)
+        t3 = threading.Thread(target=run_aud, daemon=True)
+        t1.start(); t2.start(); t3.start()
+        t1.join();  t2.join();  t3.join()
 
-        image_paths = img_result["paths"] or []
-        audio_paths = audio_result["paths"] or []
+        audio_paths = results["audio"] or []
 
-        if not image_paths:
-            raise RuntimeError(str(img_result["error"] or "No images generated"))
+        # Fill any None slots with character image as fallback
+        last_valid = character_image_path
+        for i in range(TOTAL_IMGS):
+            if image_paths[i] and os.path.exists(image_paths[i]):
+                last_valid = image_paths[i]
+            else:
+                logger.warning("[%s] Image %d missing — using fallback", session_id, i)
+                image_paths[i] = last_valid
 
-        logger.info("[%s] Parallel done: %d images, %d audio",
-                    session_id, len(image_paths), len(audio_paths))
+        logger.info("[%s] All threads done — %d images, %d audio",
+                    session_id, TOTAL_IMGS, len(audio_paths))
 
         video_path = assemble_video(
             session_id, image_paths, audio_paths,
-            load_session(session_id) or session_data,
-        )
+            load_session(session_id) or session_data)
 
         with _status_lock:
             data = load_session(session_id) or session_data
-            data["status"]           = "done"
-            data["progress"]         = 100
-            data["current_step"]     = "Vidéo prête !"
-            data["video_path"]       = video_path
-            data["video_url"]        = f"/api/download/{session_id}"
-            data["duration_seconds"] = 75.0
-            data["error"]            = None
+            data.update({
+                "status": "done", "progress": 100, "current_step": "Vidéo prête !",
+                "video_path": video_path, "video_url": f"/api/download/{session_id}",
+                "duration_seconds": 75.0, "error": None,
+                "last_heartbeat": time.time(),
+            })
             save_session(session_id, data)
 
         logger.info("[%s] Production complete", session_id)
