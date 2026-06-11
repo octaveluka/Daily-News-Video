@@ -1,4 +1,4 @@
-modules = ["nodejs-24", "python-3.11", "postgresql-16"]
+modules = ["nodejs-20", "python-3.12", "web", "postgresql-16"]
 
 [deployment]
 router = "application"
@@ -49,7 +49,7 @@ args = "PORT=18130 pnpm --filter @workspace/frontend run dev"
 waitForPort = 18130
 
 [agent]
-stack = "PNPM_WORKSPACE"
+stack = "BEST_EFFORT_FALLBACK"
 expertMode = true
 
 [postMerge]
