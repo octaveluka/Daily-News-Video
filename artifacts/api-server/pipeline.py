@@ -654,15 +654,10 @@ def _generate_gemini_tts(text: str, max_retries: int = 5) -> bytes:
             if dur < MIN_AUDIO_DURATION:
                 raise ValueError(f"Audio too short: {dur:.2f}s < {MIN_AUDIO_DURATION}s")
 
-            # 2 — Global RMS (catches total silence)
+            # 2 — Global RMS (catches total silence / empty response)
             rms = _wav_rms(wav)
             if rms < MIN_AUDIO_RMS:
                 raise ValueError(f"Audio is silent (RMS={rms:.1f})")
-
-            # 3 — Speech presence: variance of energy over time windows
-            ok, reason = _has_speech(wav)
-            if not ok:
-                raise ValueError(f"No speech detected ({reason})")
 
             logger.info("[TTS] ✓ attempt=%d dur=%.2fs rms=%.0f text=%.40s",
                         attempt + 1, dur, rms, clean)
@@ -860,26 +855,28 @@ def assemble_video(session_id: str, image_paths: list[str],
     sdir    = session_dir(session_id)
     segments = session_data["segments"]
 
-    # ── Pre-assembly pass: scan every audio file, regenerate bad ones ──────
+    # ── Pre-assembly pass: check files exist and are non-silent ────────────
     update_status(session_id, "assembling", 70,
-                  "Vérification des fichiers audio avant montage…")
+                  "Vérification des fichiers audio…")
     bad = []
     for si in range(10):
         ap = (audio_paths[si]
               if si < len(audio_paths) and audio_paths[si]
               else os.path.join(sdir, f"audio_{si:02d}.wav"))
         if not os.path.exists(ap):
-            bad.append(si); continue
-        ok, reason = audio_file_has_speech(ap)
-        if not ok:
-            logger.warning("[%s] Pre-assembly: audio %02d has no speech (%s) — queued for regen",
-                           session_id, si, reason)
+            bad.append(si)
+            continue
+        dur_check = _wav_duration(ap)
+        rms_check = _wav_rms(open(ap, "rb").read())
+        if dur_check < MIN_AUDIO_DURATION or rms_check < MIN_AUDIO_RMS:
+            logger.warning("[%s] Pre-assembly: audio %02d invalid (dur=%.2fs rms=%.0f) — regen",
+                           session_id, si, dur_check, rms_check)
             bad.append(si)
 
     if bad:
         logger.info("[%s] Pre-assembly regen for %d audio files: %s", session_id, len(bad), bad)
         update_status(session_id, "assembling", 71,
-                      f"Regénération de {len(bad)} audio(s) sans parole…")
+                      f"Regénération de {len(bad)} audio(s) invalides…")
 
         def _regen(si: int):
             ap   = os.path.join(sdir, f"audio_{si:02d}.wav")
@@ -887,7 +884,7 @@ def assemble_video(session_id: str, image_paths: list[str],
             if not text:
                 return
             try:
-                wav = _generate_gemini_tts(text, max_retries=7)
+                wav = _generate_gemini_tts(text, max_retries=5)
                 with open(ap, "wb") as f:
                     f.write(wav)
                 if si < len(audio_paths):
