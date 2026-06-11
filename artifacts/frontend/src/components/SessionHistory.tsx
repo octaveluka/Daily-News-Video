@@ -3,7 +3,7 @@ import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
-import { Download, History, RefreshCw, Play, AlertCircle, Loader2, CheckCircle } from "lucide-react";
+import { Download, History, RefreshCw, Play, AlertCircle, Loader2, CheckCircle, ArrowRight } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 
 interface SessionSummary {
@@ -11,6 +11,7 @@ interface SessionSummary {
   topic:        string;
   title:        string;
   status:       string;
+  phase?:       string;
   progress:     number;
   current_step: string;
   error:        string | null;
@@ -19,8 +20,9 @@ interface SessionSummary {
 }
 
 interface SessionHistoryProps {
-  onResumeSession: (sessionId: string) => void;
-  activeSessionId: string | null;
+  onResumeSession:   (sessionId: string) => void;
+  onContinueSession: (sessionId: string) => void;
+  activeSessionId:   string | null;
 }
 
 const STATUS_COLORS: Record<string, string> = {
@@ -45,13 +47,19 @@ function StatusIcon({ status }: { status: string }) {
   return <Loader2 className="w-3.5 h-3.5 animate-spin" />;
 }
 
-const IN_PROGRESS = new Set(["generating", "assembling", "pending"]);
+const IN_PROGRESS = new Set(["generating", "assembling"]);
 
-export function SessionHistory({ onResumeSession, activeSessionId }: SessionHistoryProps) {
+/** pending + awaiting_character = script done but no character image yet */
+function isAwaitingCharacter(s: SessionSummary) {
+  return s.status === "pending" && s.phase === "awaiting_character";
+}
+
+export function SessionHistory({ onResumeSession, onContinueSession, activeSessionId }: SessionHistoryProps) {
   const { toast }                 = useToast();
   const [sessions, setSessions]   = useState<SessionSummary[]>([]);
   const [loading, setLoading]     = useState(true);
   const [resuming, setResuming]   = useState<string | null>(null);
+  const [continuing, setContinuing] = useState<string | null>(null);
 
   const fetchSessions = async () => {
     try {
@@ -68,11 +76,23 @@ export function SessionHistory({ onResumeSession, activeSessionId }: SessionHist
     return () => clearInterval(id);
   }, []);
 
-  /**
-   * For completed sessions: just show them in the OutputZone.
-   * For in-progress sessions: call /api/resume first to restart if stalled,
-   * then switch to OutputZone to track.
-   */
+  /** "Continuer" — session has script but no character image → go back to Step 2 */
+  const handleContinuer = async (session: SessionSummary) => {
+    setContinuing(session.session_id);
+    try {
+      await onContinueSession(session.session_id);
+    } catch (err: any) {
+      toast({
+        title:       "Erreur",
+        description: err.message || "Impossible de reprendre cette session.",
+        variant:     "destructive",
+      });
+    } finally {
+      setContinuing(null);
+    }
+  };
+
+  /** "Suivre" — session is producing, resume tracking in OutputZone */
   const handleSuivre = async (session: SessionSummary) => {
     if (session.status === "done") {
       onResumeSession(session.session_id);
@@ -85,22 +105,15 @@ export function SessionHistory({ onResumeSession, activeSessionId }: SessionHist
       const data = await res.json();
 
       if (res.status === 409) {
-        // No character image saved — user needs to re-upload
         toast({
           title:       "Image manquante",
-          description: "L'image du personnage n'est pas disponible. Commencez une nouvelle session.",
+          description: "L'image du personnage n'est plus disponible. Utilisez 'Continuer' pour la re-uploader.",
           variant:     "destructive",
         });
         return;
       }
-
-      if (!res.ok) {
-        throw new Error(data.error || "Erreur lors de la reprise");
-      }
-
-      logger_info(`Resume response: ${data.message}`);
+      if (!res.ok) throw new Error(data.error || "Erreur lors de la reprise");
     } catch (err: any) {
-      // Non-fatal — we still switch to OutputZone to track whatever state is there
       console.warn("[SessionHistory] resume call:", err.message);
     } finally {
       setResuming(null);
@@ -138,6 +151,11 @@ export function SessionHistory({ onResumeSession, activeSessionId }: SessionHist
                     <StatusIcon status={session.status} />
                     {STATUS_LABELS[session.status] ?? session.status}
                   </span>
+                  {isAwaitingCharacter(session) && (
+                    <span className="text-xs font-mono px-2 py-0.5 rounded border bg-violet-500/20 text-violet-400 border-violet-500/30">
+                      Script prêt
+                    </span>
+                  )}
                   <span className="text-xs text-muted-foreground font-mono truncate">
                     {session.session_id.slice(0, 8)}
                   </span>
@@ -155,6 +173,20 @@ export function SessionHistory({ onResumeSession, activeSessionId }: SessionHist
               </div>
 
               <div className="flex items-center gap-2 shrink-0">
+                {/* Script done, no character yet → Continuer */}
+                {isAwaitingCharacter(session) && (
+                  <Button size="sm" variant="outline"
+                    disabled={continuing === session.session_id}
+                    className="h-8 text-xs font-mono border-violet-500/30 text-violet-400 hover:bg-violet-500/10"
+                    onClick={() => handleContinuer(session)}>
+                    {continuing === session.session_id
+                      ? <Loader2 className="w-3 h-3 mr-1 animate-spin" />
+                      : <ArrowRight className="w-3 h-3 mr-1" />}
+                    Continuer
+                  </Button>
+                )}
+
+                {/* Production done → Voir + Télécharger */}
                 {session.status === "done" && session.video_url && (
                   <>
                     <Button size="sm" variant="outline"
@@ -172,6 +204,7 @@ export function SessionHistory({ onResumeSession, activeSessionId }: SessionHist
                   </>
                 )}
 
+                {/* Still producing → Suivre */}
                 {IN_PROGRESS.has(session.status) && (
                   <Button size="sm" variant="outline"
                     disabled={resuming === session.session_id}
@@ -190,8 +223,4 @@ export function SessionHistory({ onResumeSession, activeSessionId }: SessionHist
       </div>
     </div>
   );
-}
-
-function logger_info(msg: string) {
-  console.info("[SessionHistory]", msg);
 }

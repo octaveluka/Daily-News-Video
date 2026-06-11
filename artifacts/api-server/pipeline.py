@@ -46,6 +46,16 @@ TEXT_API_URL   = "https://delfaapiai.vercel.app/ai/copilot"
 IMAGE_EDIT_URL = "https://gem-tw6a.onrender.com/edit"
 TTS_VOICE = "fr-FR-HenriNeural"
 
+IMAGE_STYLES: dict[str, str] = {
+    "cinematic":      "cinematic, dramatic lighting, film grain, anamorphic lens, 35mm",
+    "documentary":    "documentary photography, natural lighting, reportage style, Reuters",
+    "anime":          "anime style, vibrant colors, cel-shaded, studio ghibli inspired",
+    "watercolor":     "watercolor painting, soft brushstrokes, artistic, pastel palette",
+    "noir":           "neo-noir, high contrast, deep shadows, moody atmosphere, monochrome tones",
+    "photorealistic": "photorealistic, 8k ultra-detailed, professional DSLR photography",
+}
+DEFAULT_STYLE = "cinematic"
+
 FPS          = 24
 TOTAL_IMGS   = 20
 SECTION_SIZE = 5    # images per section
@@ -188,7 +198,8 @@ def list_sessions() -> list[dict]:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute("""
                     SELECT session_id, topic, title, status, progress,
-                           current_step, error, video_path, created_at
+                           current_step, error, video_path, created_at,
+                           data->>'phase' AS phase
                     FROM sessions ORDER BY created_at DESC
                 """)
                 rows = cur.fetchall()
@@ -197,6 +208,7 @@ def list_sessions() -> list[dict]:
                     "topic":        r["topic"],
                     "title":        r["title"],
                     "status":       r["status"],
+                    "phase":        r["phase"] or "producing",
                     "progress":     r["progress"],
                     "current_step": r["current_step"],
                     "error":        r["error"],
@@ -254,8 +266,10 @@ def auto_resume_stalled_sessions():
             char_img = data.get("character_image_path")
             if not char_img or not os.path.exists(char_img):
                 continue
-            logger.info("[auto-resume] Restarting stalled session %s", sid)
-            t = threading.Thread(target=run_production, args=(sid, char_img), daemon=True)
+            vfmt  = data.get("video_format", "16:9")
+            style = data.get("image_style", DEFAULT_STYLE)
+            logger.info("[auto-resume] Restarting stalled session %s (fmt=%s style=%s)", sid, vfmt, style)
+            t = threading.Thread(target=run_production, args=(sid, char_img, vfmt, style), daemon=True)
             t.start()
         except Exception as e:
             logger.warning("[auto-resume] Error checking session %s: %s", row.get("session_id"), e)
@@ -394,6 +408,7 @@ def fetch_news_and_generate_script(custom_topic: str | None = None) -> dict:
         "hashtags":      data.get("hashtags", ["#reportage","#documentaire","#info","#actualité","#viral"])[:5],
         "segments":      segments,
         "status":        "pending",
+        "phase":         "awaiting_character",
         "progress":      0,
         "current_step":  "Script généré — en attente de l'image du personnage.",
         "images_done":   [],
@@ -423,10 +438,12 @@ def _encode_b64(path: str) -> str:
 def _generate_one_image(session_id: str, i: int, prompt: str,
                          character_image_path: str, video_format: str,
                          counters: dict, lock: threading.Lock,
-                         image_paths: list) -> None:
+                         image_paths: list,
+                         image_style: str = "cinematic") -> None:
     img_path = os.path.join(session_dir(session_id), f"image_{i:02d}.jpg")
-    fmt_hint = _format_hint(video_format)
-    full_prompt = f"{prompt}, {fmt_hint}"
+    fmt_hint    = _format_hint(video_format)
+    style_sfx   = IMAGE_STYLES.get(image_style, IMAGE_STYLES[DEFAULT_STYLE])
+    full_prompt = f"{prompt}, {style_sfx}, {fmt_hint}"
     success = False
 
     for attempt in range(3):
@@ -481,7 +498,8 @@ def _generate_one_image(session_id: str, i: int, prompt: str,
 def generate_all_images(session_id: str, character_image_path: str,
                          all_prompts: list[str], video_format: str,
                          counters: dict, lock: threading.Lock,
-                         image_paths: list) -> None:
+                         image_paths: list,
+                         image_style: str = "cinematic") -> None:
     """4 sections of 5 images each, all running simultaneously."""
     sections = [
         list(range(s * SECTION_SIZE, s * SECTION_SIZE + SECTION_SIZE))
@@ -492,7 +510,8 @@ def generate_all_images(session_id: str, character_image_path: str,
         with ThreadPoolExecutor(max_workers=SECTION_SIZE) as pool:
             futures = [
                 pool.submit(_generate_one_image, session_id, idx, all_prompts[idx],
-                            character_image_path, video_format, counters, lock, image_paths)
+                            character_image_path, video_format, counters, lock, image_paths,
+                            image_style)
                 for idx in indices
             ]
             for f in as_completed(futures):
@@ -847,7 +866,7 @@ def create_bundle_zip(session_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 def run_production(session_id: str, character_image_path: str,
-                   video_format: str = "16:9"):
+                   video_format: str = "16:9", image_style: str = "cinematic"):
     try:
         session_data = load_session(session_id)
         if not session_data:
@@ -858,6 +877,8 @@ def run_production(session_id: str, character_image_path: str,
             data = load_session(session_id) or {}
             data["character_image_path"] = character_image_path
             data["video_format"]         = video_format
+            data["image_style"]          = image_style
+            data["phase"]                = "producing"
             save_session(session_id, data)
 
         all_prompts = [p for seg in session_data["segments"] for p in seg["image_prompts"]]
@@ -878,7 +899,7 @@ def run_production(session_id: str, character_image_path: str,
         def run_img():
             try:
                 generate_all_images(session_id, character_image_path, all_prompts,
-                                    video_format, counters, lock, image_paths)
+                                    video_format, counters, lock, image_paths, image_style)
             except Exception as e:
                 results["err_img"] = e
                 logger.error("[%s] Images thread: %s", session_id, e, exc_info=True)

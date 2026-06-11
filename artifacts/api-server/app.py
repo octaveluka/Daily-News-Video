@@ -15,6 +15,7 @@ from pipeline import (
     repair_audio_files,
     _wav_duration, MIN_AUDIO_DURATION,
     SESSIONS_DIR,
+    IMAGE_STYLES, DEFAULT_STYLE,
 )
 
 logging.basicConfig(level=logging.INFO,
@@ -68,27 +69,31 @@ def produce_video(session_id: str):
     if "character_image" not in request.files:
         return jsonify({"error": "Missing character_image file"}), 400
 
-    # Read video format (default 16:9)
     video_format = "16:9"
     if request.form.get("video_format") in ("16:9", "9:16"):
         video_format = request.form.get("video_format")
+
+    image_style = request.form.get("image_style", DEFAULT_STYLE)
+    if image_style not in IMAGE_STYLES:
+        image_style = DEFAULT_STYLE
 
     image_file = request.files["character_image"]
     import uuid as _uuid
     char_path = os.path.join(session_dir(session_id),
                              f"character_{_uuid.uuid4().hex}.jpg")
     image_file.save(char_path)
-    logger.info("Character image saved: %s | format: %s", char_path, video_format)
+    logger.info("Character image saved: %s | format: %s | style: %s", char_path, video_format, image_style)
 
     update_status(session_id, "pending", 0,
-                  f"Démarrage de la production ({video_format})…",
+                  f"Démarrage de la production ({video_format}, {image_style})…",
                   images_done=[], audio_done=[],
                   character_image_path=char_path,
-                  video_format=video_format)
+                  video_format=video_format,
+                  image_style=image_style)
 
     threading.Thread(
         target=run_production,
-        args=(session_id, char_path, video_format),
+        args=(session_id, char_path, video_format, image_style),
         daemon=True
     ).start()
     return jsonify({"session_id": session_id, "status": "pending"}), 202
@@ -116,14 +121,15 @@ def resume_session(session_id: str):
                         "message": "Character image not found — please upload again"}), 409
 
     video_format = data.get("video_format", "16:9")
-    logger.info("Resuming session %s (status was %s, format=%s)", session_id, status, video_format)
+    image_style  = data.get("image_style", DEFAULT_STYLE)
+    logger.info("Resuming session %s (status=%s, format=%s, style=%s)", session_id, status, video_format, image_style)
     update_status(session_id, "pending", data.get("progress", 0),
                   "Reprise de la production…",
                   images_done=data.get("images_done", []),
                   audio_done=data.get("audio_done", []))
     threading.Thread(
         target=run_production,
-        args=(session_id, char_img, video_format),
+        args=(session_id, char_img, video_format, image_style),
         daemon=True
     ).start()
     return jsonify({"status": "resuming", "message": "Production restarted"}), 202
@@ -315,6 +321,167 @@ def reassemble(session_id: str):
 
     threading.Thread(target=_do_reassemble, daemon=True).start()
     return jsonify({"session_id": session_id, "status": "reassembling"}), 202
+
+
+# ---------------------------------------------------------------------------
+# Session data (for frontend resume-to-step-2)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/session-data/<session_id>")
+def get_session_data(session_id: str):
+    data = load_session(session_id)
+    if not data:
+        return jsonify({"error": "Session not found"}), 404
+    safe = {k: v for k, v in data.items() if k != "character_image_path"}
+    return jsonify(safe), 200
+
+
+@app.route("/api/styles")
+def get_styles():
+    return jsonify({
+        "styles": [
+            {"id": "cinematic",      "label": "Cinématique",    "description": "Lumière dramatique, grain de film"},
+            {"id": "documentary",    "label": "Documentaire",   "description": "Lumière naturelle, style reportage"},
+            {"id": "anime",          "label": "Anime",          "description": "Couleurs vives, cel-shaded"},
+            {"id": "watercolor",     "label": "Aquarelle",      "description": "Peinture douce, palette pastel"},
+            {"id": "noir",           "label": "Néo-Noir",       "description": "Contraste fort, ambiance sombre"},
+            {"id": "photorealistic", "label": "Photoréaliste",  "description": "Photo DSLR professionnelle, 8k"},
+        ],
+        "default": DEFAULT_STYLE,
+    }), 200
+
+
+# ---------------------------------------------------------------------------
+# Public API v1 — for bots / automations / external integrations
+# ---------------------------------------------------------------------------
+
+@app.route("/api/v1/generate", methods=["POST"])
+def v1_generate():
+    """
+    Public API endpoint — generate a full video from JSON params.
+
+    Body (JSON):
+        prompt         string  Topic / subject of the video (required)
+        character_url  string  Public URL of the character image (required)
+        style          string  Image style: cinematic|documentary|anime|watercolor|noir|photorealistic
+        format         string  Video format: 16:9 | 9:16  (default: 16:9)
+
+    Returns 202 with session_id and polling URLs.
+    """
+    if not request.is_json:
+        return jsonify({"error": "Content-Type must be application/json"}), 400
+
+    body          = request.get_json(force=True) or {}
+    prompt        = (body.get("prompt") or "").strip()
+    character_url = (body.get("character_url") or "").strip()
+    image_style   = body.get("style",  DEFAULT_STYLE)
+    video_format  = body.get("format", "16:9")
+
+    if not prompt:
+        return jsonify({"error": "Missing required field: prompt"}), 400
+    if not character_url:
+        return jsonify({"error": "Missing required field: character_url"}), 400
+    if image_style not in IMAGE_STYLES:
+        image_style = DEFAULT_STYLE
+    if video_format not in ("16:9", "9:16"):
+        video_format = "16:9"
+
+    # 1 — Generate script from prompt
+    try:
+        result = fetch_news_and_generate_script(custom_topic=prompt)
+    except Exception as e:
+        logger.error("[v1] Script generation failed: %s", e, exc_info=True)
+        return jsonify({"error": f"Script generation failed: {e}"}), 500
+
+    session_id = result["session_id"]
+
+    # 2 — Download character image from URL
+    import requests as _req
+    import uuid as _uuid
+    try:
+        resp = _req.get(character_url, timeout=30)
+        resp.raise_for_status()
+        content_type = resp.headers.get("content-type", "image/jpeg")
+        ext = "jpg" if "jpeg" in content_type or "jpg" in content_type else "png"
+        char_path = os.path.join(session_dir(session_id), f"character_{_uuid.uuid4().hex}.{ext}")
+        with open(char_path, "wb") as f:
+            f.write(resp.content)
+        if len(resp.content) < 1000:
+            raise ValueError("Downloaded image too small — invalid URL?")
+    except Exception as e:
+        logger.error("[v1] Character image download failed: %s", e)
+        return jsonify({"error": f"Failed to download character_url: {e}"}), 400
+
+    # 3 — Start production in background
+    update_status(session_id, "pending", 0,
+                  f"API: démarrage ({video_format}, {image_style})…",
+                  images_done=[], audio_done=[],
+                  character_image_path=char_path,
+                  video_format=video_format,
+                  image_style=image_style)
+
+    threading.Thread(
+        target=run_production,
+        args=(session_id, char_path, video_format, image_style),
+        daemon=True,
+    ).start()
+
+    base = request.host_url.rstrip("/")
+    return jsonify({
+        "session_id":   session_id,
+        "status":       "pending",
+        "poll_url":     f"{base}/api/v1/status/{session_id}",
+        "download_url": f"{base}/api/v1/download/{session_id}",
+        "result_url":   f"{base}/api/v1/result/{session_id}",
+    }), 202
+
+
+@app.route("/api/v1/status/<session_id>")
+def v1_status(session_id: str):
+    data = load_session(session_id)
+    if not data:
+        return jsonify({"error": "Session not found"}), 404
+    return jsonify({
+        "session_id":   session_id,
+        "status":       data.get("status",       "pending"),
+        "progress":     data.get("progress",     0),
+        "current_step": data.get("current_step", "…"),
+        "error":        data.get("error"),
+    }), 200
+
+
+@app.route("/api/v1/download/<session_id>")
+def v1_download(session_id: str):
+    data = load_session(session_id)
+    if not data:
+        return jsonify({"error": "Session not found"}), 404
+    if data.get("status") != "done":
+        return jsonify({"error": "Video not ready", "status": data.get("status")}), 202
+    vp = data.get("video_path")
+    if not vp or not os.path.exists(vp):
+        return jsonify({"error": "Video file missing"}), 404
+    return send_file(vp, mimetype="video/mp4", as_attachment=True,
+                     download_name=f"video_{session_id[:8]}.mp4")
+
+
+@app.route("/api/v1/result/<session_id>")
+def v1_result(session_id: str):
+    data = load_session(session_id)
+    if not data:
+        return jsonify({"error": "Session not found"}), 404
+    base = request.host_url.rstrip("/")
+    return jsonify({
+        "session_id":       session_id,
+        "status":           data.get("status", "pending"),
+        "progress":         data.get("progress", 0),
+        "title":            data.get("title",            ""),
+        "description":      data.get("description",      ""),
+        "hashtags":         data.get("hashtags",         []),
+        "video_format":     data.get("video_format",     "16:9"),
+        "image_style":      data.get("image_style",      DEFAULT_STYLE),
+        "download_url":     f"{base}/api/v1/download/{session_id}" if data.get("status") == "done" else None,
+        "duration_seconds": data.get("duration_seconds", None),
+    }), 200
 
 
 # ---------------------------------------------------------------------------

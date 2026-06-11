@@ -5,6 +5,23 @@ import { ImagePlus, UserCircle, Play, Monitor, Smartphone } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import type { VideoFormat } from "@/pages/Home";
 
+export type ImageStyle =
+  | "cinematic"
+  | "documentary"
+  | "anime"
+  | "watercolor"
+  | "noir"
+  | "photorealistic";
+
+const STYLES: { id: ImageStyle; label: string; emoji: string; desc: string }[] = [
+  { id: "cinematic",      label: "Cinématique",   emoji: "🎬", desc: "Grain de film, lumière dramatique" },
+  { id: "documentary",    label: "Documentaire",  emoji: "📷", desc: "Lumière naturelle, reportage" },
+  { id: "anime",          label: "Anime",         emoji: "🎌", desc: "Cel-shaded, couleurs vives" },
+  { id: "watercolor",     label: "Aquarelle",     emoji: "🎨", desc: "Peinture douce, palette pastel" },
+  { id: "noir",           label: "Néo-Noir",      emoji: "🕵️", desc: "Contraste fort, ambiance sombre" },
+  { id: "photorealistic", label: "Photoréaliste", emoji: "📸", desc: "DSLR professionnel, 8k" },
+];
+
 interface UploadZoneProps {
   isActive:       boolean;
   isDisabled:     boolean;
@@ -14,17 +31,20 @@ interface UploadZoneProps {
   sessionId?:     string;
   videoFormat:    VideoFormat;
   onFormatChange: (fmt: VideoFormat) => void;
+  imageStyle:     ImageStyle;
+  onStyleChange:  (style: ImageStyle) => void;
 }
 
 export function UploadZone({
   isActive, isDisabled, characterImage, onImageChange,
   onProduce, sessionId, videoFormat, onFormatChange,
+  imageStyle, onStyleChange,
 }: UploadZoneProps) {
-  const [isDragging, setIsDragging] = useState(false);
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [isStarting, setIsStarting] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const { toast } = useToast();
+  const [isDragging, setIsDragging]   = useState(false);
+  const [previewUrl, setPreviewUrl]   = useState<string | null>(null);
+  const [isStarting, setIsStarting]   = useState(false);
+  const fileInputRef                  = useRef<HTMLInputElement>(null);
+  const { toast }                     = useToast();
 
   const handleDragOver  = (e: React.DragEvent) => { e.preventDefault(); if (!isDisabled) setIsDragging(true); };
   const handleDragLeave = () => setIsDragging(false);
@@ -54,7 +74,8 @@ export function UploadZone({
     try {
       const formData = new FormData();
       formData.append("character_image", characterImage);
-      formData.append("video_format", videoFormat);
+      formData.append("video_format",    videoFormat);
+      formData.append("image_style",     imageStyle);
 
       const res = await fetch(`/api/produce/${sessionId}`, { method: "POST", body: formData });
       if (!res.ok) {
@@ -104,6 +125,30 @@ export function UploadZone({
         </button>
       </div>
 
+      {/* ── Style selector ── */}
+      <div className="mb-4">
+        <p className="text-xs font-mono uppercase tracking-widest text-muted-foreground mb-2">
+          Style visuel
+        </p>
+        <div className="grid grid-cols-3 gap-2">
+          {STYLES.map((s) => (
+            <button
+              key={s.id}
+              onClick={() => onStyleChange(s.id)}
+              title={s.desc}
+              className={`flex flex-col items-center justify-center gap-1 py-2 px-2 rounded border text-xs font-mono transition-all ${
+                imageStyle === s.id
+                  ? "border-primary bg-primary/10 text-primary shadow-[0_0_10px_rgba(0,255,255,0.15)]"
+                  : "border-border text-muted-foreground hover:border-primary/40 hover:text-foreground"
+              }`}
+            >
+              <span className="text-base leading-none">{s.emoji}</span>
+              <span className="uppercase tracking-wide leading-none">{s.label}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
       {/* ── Image dropzone ── */}
       <Card
         className={`border-dashed border-2 bg-card/50 p-8 transition-colors ${
@@ -133,9 +178,15 @@ export function UploadZone({
             </div>
             <div className="flex-1 text-center md:text-left">
               <h3 className="text-lg font-bold mb-1 font-mono uppercase text-primary">Identity Registered</h3>
-              <p className="text-xs text-muted-foreground font-mono mb-4">
+              <p className="text-xs text-muted-foreground font-mono mb-1">
                 Format : <span className="text-primary font-bold">{videoFormat}</span>
                 {videoFormat === "9:16" ? " — 720×1280" : " — 1280×720"}
+              </p>
+              <p className="text-xs text-muted-foreground font-mono mb-4">
+                Style : <span className="text-primary font-bold">
+                  {STYLES.find(s => s.id === imageStyle)?.emoji}{" "}
+                  {STYLES.find(s => s.id === imageStyle)?.label}
+                </span>
               </p>
               <div className="flex flex-col sm:flex-row gap-3">
                 <Button
@@ -167,7 +218,10 @@ export function UploadZone({
               Glissez-déposez ou cliquez pour choisir. Le personnage apparaîtra dans tous les segments.
             </p>
             <p className="text-xs font-mono text-primary/60">
-              Format sélectionné : <span className="text-primary">{videoFormat}</span>
+              Format : <span className="text-primary">{videoFormat}</span>
+              {" · "}Style : <span className="text-primary">
+                {STYLES.find(s => s.id === imageStyle)?.emoji} {STYLES.find(s => s.id === imageStyle)?.label}
+              </span>
             </p>
           </div>
         )}
